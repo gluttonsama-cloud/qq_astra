@@ -122,7 +122,7 @@ class Application:
             return await self._lifespan(receive, send)
         if scope["type"] != "http":
             return
-        required_scope = "qq:read"
+        required_scope, request, parse_error = "qq:read", None, False
         try:
             raw_headers = scope.get("headers", [])
             headers = {k.decode("ascii").lower(): v.decode("latin1") for k, v in raw_headers}
@@ -174,14 +174,12 @@ class Application:
                     account_id=int(self.bridge.filters["account_id"]), peer_id=int(self.bridge.filters["conversation_id"]), now=self.bridge.clock())
                 await asyncio.to_thread(self.bridge.ingest, record)
                 return await self._respond(send, 200, {})
-            # Verify the token before returning a parser error, without granting a scope.
-            await asyncio.to_thread(self.auth.authenticate, headers.get("authorization"), None)
-            if headers.get("mcp-protocol-version") not in (None, "2026-07-28"):
-                return await self._respond(send, 400, {"error": "unsupported protocol version"})
+            # Parse only to choose the auth response/scope; no tool is invoked
+            # and no parser result is returned until token validation succeeds.
             try:
                 request = json.loads(body)
             except (ValueError, UnicodeError):
-                return await self._respond(send, 200, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                parse_error = True
             if isinstance(request, dict):
                 method_name, params = request.get("method", ""), request.get("params", {})
                 if method_name in ("events/subscribe", "events/unsubscribe"):
@@ -190,6 +188,10 @@ class Application:
                     required_scope = "qq:reply"
             _, expires_at = await asyncio.to_thread(self.auth.authenticate_with_expiry, headers.get("authorization"), required_scope)
             principal = self.auth.binding_principal
+            if headers.get("mcp-protocol-version") not in (None, "2026-07-28"):
+                return await self._respond(send, 400, {"error": "unsupported protocol version"})
+            if parse_error:
+                return await self._respond(send, 200, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
             if isinstance(request, dict) and request.get("method") == "events/subscribe" and isinstance(request.get("params"), dict):
                 params = dict(request["params"])
                 remaining_ms = min(3600000, int((expires_at - time.time()) * 1000))
@@ -203,6 +205,16 @@ class Application:
             return await self._respond(send, 200, result)
         except AuthError as exc:
             challenge = self.auth.www_authenticate(required_scope, exc.error).encode("ascii")
+            # Tool-level relinking needs the MCP result metadata, not only an
+            # HTTP challenge. Do not turn a broken local trust store into login.
+            if (exc.status_code in (401, 403) and isinstance(request, dict)
+                    and request.get("jsonrpc") == "2.0" and type(request.get("id")) in (str, int)
+                    and request.get("method") == "tools/call" and isinstance(request.get("params"), dict)
+                    and request["params"].get("name") in ("bridge_status", "qq_reply")
+                    and isinstance(request["params"].get("arguments", {}), dict)):
+                return await self._respond(send, 200, {"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "isError": True, "content": [{"type": "text", "text": "Authorization is required for this tool."}],
+                    "_meta": {"mcp/www_authenticate": [challenge.decode("ascii")]}}})
             return await self._respond(send, exc.status_code, {"error": exc.error or "authentication unavailable"}, [(b"www-authenticate", challenge)])
         except GatewayRejected:
             return await self._respond(send, 403, {"error": "gateway message rejected"})

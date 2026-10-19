@@ -124,7 +124,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request(value=rpc, token=self.token(sub="stranger")))[0], 401)
         self.assertEqual((await self.request(value=rpc, token=self.token("qq:read")))[0], 200)
         rpc.update(method="tools/call", params={"name": "qq_reply", "arguments": {}})
-        self.assertEqual((await self.request(value=rpc, token=self.token("qq:read")))[0], 403)
+        expired = self.token(iat=int(time.time()) - 100, exp=int(time.time()) - 1)
+        for token, error in ((self.token("qq:read"), "insufficient_scope"), (expired, "invalid_token"), (None, "invalid_token")):
+            status, data, _ = await self.request(value=rpc, token=token)
+            self.assertEqual(status, 200)
+            self.assertTrue(data["result"]["isError"])
+            challenge = data["result"]["_meta"]["mcp/www_authenticate"][0]
+            self.assertIn('scope="qq:reply"', challenge)
+            self.assertIn('error="' + error + '"', challenge)
+            self.assertIn('error_description="', challenge)
+        self.assertEqual(self.gateway.sent, [])
+        event_rpc = {**rpc, "method": "events/subscribe", "params": self.subscription()}
+        self.assertEqual((await self.request(value=event_rpc, token=self.token("qq:read")))[0], 403)
         self.assertEqual((await self.request(value=rpc, token=self.token(), headers=[(b"origin", b"https://stranger.example")]))[0], 403)
         self.app.limits["mcp"] = RateLimit(rate=0, burst=0)
         self.assertEqual((await self.request(value=rpc, token=self.token()))[0], 429)

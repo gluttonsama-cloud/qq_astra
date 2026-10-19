@@ -156,15 +156,19 @@ class CoreTests(unittest.TestCase):
         self.bridge.dispatch_event()
         self.assertEqual(len(self.callback.requests[-1][2]["webhook-signature"].split(" ")), 2)
 
-    def test_inflight_refresh_cannot_revive_unsubscribe(self):
-        self.subscribe()
+    def test_inflight_creation_or_refresh_cannot_revive_unsubscribe(self):
         def revoked(url, body, headers):
             self.bridge.unsubscribe("owner", self.params)
+            self.bridge = self.reopen()  # Cancellation is persisted, not in-memory.
             return 200, canonical({"challenge": json.loads(body)["challenge"]}).encode()
-        with patch.object(self.callback, "post", side_effect=revoked):
-            with self.assertRaises(RpcError):
-                self.subscribe(delivery={**self.params["delivery"], "secret": SECOND})
-        self.assertEqual(self.bridge.status("owner")["active_subscriptions"], 0)
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh):
+                if refresh:
+                    self.subscribe()
+                with patch.object(self.callback, "post", side_effect=revoked):
+                    with self.assertRaises(RpcError):
+                        self.subscribe(delivery={**self.params["delivery"], "secret": SECOND})
+                self.assertEqual(self.bridge.status("owner")["active_subscriptions"], 0)
 
     def test_unsubscribe_expiry_and_revocation_stop_delivery(self):
         self.subscribe(ttlMs=1000)

@@ -251,9 +251,20 @@ class Bridge:
 
     def unsubscribe(self, principal, params):
         self.authorize(principal)
-        sub_id, _ = self._subscription(params, False)
+        sub_id, delivery = self._subscription(params, False)
         with self.db() as db:
-            db.execute("UPDATE subscriptions SET active=0,secret='',old_secret=NULL WHERE id=?", (sub_id,))
+            db.execute("BEGIN IMMEDIATE")
+            self.authorize(principal, db)
+            existing = db.execute("SELECT 1 FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+            if existing is None and db.execute("SELECT count(*) FROM subscriptions").fetchone()[0] >= 100:
+                # New subscriptions cannot commit at this limit either.
+                return {}
+            # Persist a per-subscription tombstone even if the first challenge
+            # has not committed yet, so a successful unsubscribe cannot revive.
+            db.execute("""INSERT INTO subscriptions(id,url,secret,old_secret,rotate_until,expires,verified_until,active)
+                VALUES(?,?,'',NULL,NULL,0,0,0)
+                ON CONFLICT(id) DO UPDATE SET active=0,secret='',old_secret=NULL,
+                generation=subscriptions.generation+1""", (sub_id, self._seal(delivery["url"])))
             db.execute("UPDATE deliveries SET state='cancelled' WHERE sub_id=? AND state IN ('pending','sending')", (sub_id,))
         return {}
 

@@ -31,7 +31,7 @@ python -m venv .venv
 `config.example.json` 是故意不能直接启动的模板，不含可用凭据。配置必须由操作者提供；服务不会生成账号、OAuth grant、密钥或 Tunnel。
 
 1. 使用已有 OAuth 授权服务器，支持 ChatGPT 的授权流程、PKCE 和资源指示符。配置准确的 issuer、主人 subject、公开 `/mcp` URL，以及可信公钥 JWKS。服务是资源服务器，不是授权服务器。
-2. 配置当前网关的 loopback HTTP 地址、已授权的账号/好友 ID 和既有 token 文件。网关 HTTP 事件 POST 到 `http://127.0.0.1:8765/onebot/events`，原始 JSON 使用该 token 签名；不能配置 quick-operation 回复。端口可改。
+2. 配置当前网关的 loopback HTTP 地址、已授权的账号/好友 ID 和既有 token 文件。网关 HTTP 服务与 HTTP 上报两侧的 `accessToken` 都须与该文件一致，消息格式设为 `messageFormat=array`。事件 POST 到 `http://127.0.0.1:8765/onebot/events`，原始 JSON 使用该 token 签名；桥接响应不执行 quick-operation 回复。端口可改。
 3. 将配置与秘密文件放在仓库外的私密目录。配置、token、既有 Fernet state key 文件需当前用户所有、0400/0600；状态目录0700，数据库0600。JWKS可0644，但不得可被其他用户写入。父路径不得使用符号链接或不可信可写目录。保管好 state key，丢失后无法解密。
 4. 验证配置，再运行服务：
 
@@ -47,7 +47,7 @@ HTTPS 代理/Tunnel 只转发 `/mcp` 和 OAuth protected-resource metadata 路�
 ### OAuth 与状态约束
 
 - 仅接收 `typ=at+jwt` 或 `application/at+jwt` 的 RS256/ES256 access token，严格校验签名、issuer、单一精确 audience、固定 subject、时间和 scope。持久身份同时绑定 issuer、resource 与 subject，改变其中任一项不能复用旧状态。通用 `typ=JWT`、ID token、opaque token 不支持；身份提供方必须匹配此配置。
-- `qq:read` 用于发现/目录/状态，`qq:events` 用于订阅，`qq:reply` 用于回复。公钥文件每次校验重读，原子替换支持公钥轮换。服务不下载不受信任的 token 内 JWKS URL。
+- `qq:read` 用于发现/目录/状态，`qq:events` 用于订阅，`qq:reply` 用于回复；完整桥接需授予三项权限。工具缺权限或凭据过期时返回标准重新授权 metadata；发现/Events 使用 HTTP challenge，实际授权界面仍待联调。公钥文件每次校验重读，原子替换支持公钥轮换。服务不下载不受信任的 token 内 JWKS URL。
 - 生产订阅最多持续1小时，并且不能超过创建/刷新 access token 的有效期。没有 OAuth introspection；已创建的订阅在租约内仍有效，停服务或本地撤销绑定可立即阻止后续工作。已开始的网络发送无法撤回。
 - 默认状态路径为 `$XDG_STATE_HOME/qq-astra` 或 `~/.local/state/qq-astra`，需本机可靠 SQLite/flock 文件系统。自动保留最多10,000条收件，可用 `max_messages` 调至1–100,000；达到上限会拒绝新消息，不暗中删数据。暂不提供保留期清理或密钥迁移。
 - 正常重启自动恢复已提交队列；中断的 QQ 发送标记 `uncertain`，不重发。停止备份为 `bridge.backup.sqlite3`；损坏时保留原库和 sidecar，拒绝启动，不自动用旧备份覆盖。人工恢复需停服务、保留原文件、验证备份及同一 state key/绑定。加密不隐藏数量、时序等元数据，也不防御已控制服务账号的攻击者。

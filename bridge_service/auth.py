@@ -206,4 +206,7 @@ class Authenticator:
             parts.append(f'scope="{required_scope}"')
         if error is not None:
             parts.append(f'error="{error}"')
+            description = ("Authorize the required tool permission" if error == "insufficient_scope"
+                           else "A valid access token is required")
+            parts.append(f'error_description="{description}"')
         return ", ".join(parts)
