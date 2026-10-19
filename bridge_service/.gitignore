@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.sqlite3*
+.venv/
+.env
+private/
+config.json
+*.key
+*.token
+public-jwks.json
