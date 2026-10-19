@@ -283,17 +283,28 @@ def create_application(config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config")
+    source.add_argument("--prepare-windows-directory", metavar="PATH", help="create/verify a private Windows project directory; no credentials or service")
     parser.add_argument("--check", action="store_true", help="validate configuration without opening a listener or sending traffic")
     args = parser.parse_args()
     app = None
     try:
+        if args.prepare_windows_directory:
+            if os.name != "nt" or args.check:
+                raise ValueError("private Windows directory preparation requires Windows")
+            from .windows_state import WindowsPrivateDirectory
+            with WindowsPrivateDirectory(args.prepare_windows_directory):
+                pass
+            print("Private Windows directory verified. No credentials, listener or system service was created.")
+            return
         config = load_config(args.config)
         if args.check:
             validate_configuration(config)
             print("Authentication and secret-file configuration valid; no network or account connectivity was tested.")
             return
-        os.umask(0o077)
+        if os.name == "posix":
+            os.umask(0o077)
         app = create_application(config)
         uvicorn.run(app, host="127.0.0.1", port=config.get("listen_port", 8765), workers=1,
                     http="h11", ws="none", lifespan="on", proxy_headers=False,

@@ -10,14 +10,13 @@ import json
 import math
 import os
 import re
-import stat
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
-from .state import StateError, _directory_fd
+from .state import StateError, read_public_key_file
 
 SCOPES = ("qq:read", "qq:events", "qq:reply")
 _ALGORITHMS = {"RS256": "RSA", "ES256": "EC"}
@@ -84,25 +83,8 @@ class Authenticator:
         self._load_keys()  # Refuse startup with incomplete or unsafe trust settings.
 
     def _load_keys(self):
-        directory = None
         try:
-            # POSIX permission checks are mandatory for this local trust anchor.
-            # O_NOFOLLOW closes the check/open race; NONBLOCK prevents a FIFO
-            # replacement from hanging the request before fstat rejects it.
-            if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "geteuid"):
-                raise ValueError()
-            # Validate every parent, then open relative to the checked fd so
-            # path replacement cannot redirect this read to another directory.
-            directory = _directory_fd(self.jwks_path.parent)
-            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-            with os.fdopen(os.open(self.jwks_path.name, flags, dir_fd=directory), "rb") as source:
-                info = os.fstat(source.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
-                        or info.st_mode & 0o022 or info.st_size > _JWKS_LIMIT):
-                    raise ValueError()
-                raw = source.read(_JWKS_LIMIT + 1)
-            if len(raw) > _JWKS_LIMIT:
-                raise ValueError()
+            raw = read_public_key_file(self.jwks_path, max_bytes=_JWKS_LIMIT)
             document = json.loads(raw)
             entries = document.get("keys") if isinstance(document, dict) else None
             if not isinstance(entries, list) or not 1 <= len(entries) <= 64:
@@ -131,9 +113,6 @@ class Authenticator:
             return keys
         except (OSError, ValueError, TypeError, KeyError, RecursionError, StateError, jwt.PyJWTError):
             raise _configuration_error() from None
-        finally:
-            if directory is not None:
-                os.close(directory)
 
     def authenticate(self, authorization_header, required_scope=None):
         """Return only the verified owner subject; never an unverified claim."""
