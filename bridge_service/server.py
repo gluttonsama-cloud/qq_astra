@@ -102,7 +102,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if not args.fixture:
-        parser.error("production startup disabled: verified OAuth principal, protected storage and deployment integration are not configured")
+        parser.error("fixture flag required here; configured service uses python -m bridge_service.runtime --config <private-config.json>")
     with make_fixture_server(args.port) as server:
         print(f"Fixture only: http://127.0.0.1:{server.server_port}/mcp; no real QQ/dot delivery. Do not publish or tunnel this harness.")
         try:

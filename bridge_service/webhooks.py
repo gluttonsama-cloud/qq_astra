@@ -1,8 +1,8 @@
 """Standard Webhooks signing and opt-in, public-address-only HTTPS delivery.
 
 No connection is made until ``PublicWebhookTransport.post`` is explicitly used.
-Socket operations have a timeout; deployment must also bound DNS lookup time and
-enforce an outbound network policy. No proxy environment variables are used.
+A shared monotonic deadline bounds DNS and all network operations, including
+slow-trickle response headers and bodies. No proxy environment variables are used.
 """
 
 from __future__ import annotations
@@ -11,11 +11,15 @@ import base64
 import binascii
 from datetime import datetime, timezone
 import http.client
+import io
 import ipaddress
 import math
+import queue
 import re
 import socket
 import ssl
+import threading
+import time
 from collections.abc import Mapping
 from urllib.parse import SplitResult, urlsplit
 
@@ -24,6 +28,96 @@ from standardwebhooks import Webhook
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
+# Python cannot cancel an OS getaddrinfo call. A timed-out resolver retains its
+# slot until it returns; at most four daemon threads can remain stuck process-wide.
+_DNS_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("webhook delivery deadline exceeded")
+    return remaining
+
+
+def _resolve(host: str, port: int, deadline: float) -> list:
+    """Bound both resolver admission and waiting, without leaking new threads."""
+    if not _DNS_SLOTS.acquire(timeout=_remaining(deadline)):
+        raise TimeoutError("webhook DNS resolver capacity deadline exceeded")
+    result = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            # A thread delayed until after the caller's deadline does no work.
+            _remaining(deadline)
+            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        except Exception as exc:
+            result.put((False, exc))
+        finally:
+            _DNS_SLOTS.release()
+
+    try:
+        threading.Thread(target=resolve, name="webhook-dns", daemon=True).start()
+    except BaseException:
+        _DNS_SLOTS.release()
+        raise
+    try:
+        success, value = result.get(timeout=_remaining(deadline))
+    except queue.Empty as exc:
+        raise TimeoutError("webhook DNS lookup deadline exceeded") from exc
+    _remaining(deadline)
+    if not success:
+        raise value
+    return value
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Refresh the remaining budget before every raw read, not each HTTP phase."""
+
+    def __init__(self, raw, sock, deadline: float) -> None:
+        super().__init__()
+        self._raw, self._sock, self._deadline = raw, sock, deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        self._sock.settimeout(_remaining(self._deadline))
+        count = self._raw.readinto(buffer)
+        _remaining(self._deadline)
+        return count
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _DeadlineSocket:
+    """Socket adapter used by http.client for deadline-aware sends and reads."""
+
+    def __init__(self, sock, deadline: float) -> None:
+        self._sock, self._deadline = sock, deadline
+
+    def sendall(self, data) -> None:
+        pending = memoryview(data)
+        while pending:
+            self._sock.settimeout(_remaining(self._deadline))
+            sent = self._sock.send(pending)
+            if sent == 0:
+                raise ConnectionError("webhook socket closed during send")
+            pending = pending[sent:]
+        _remaining(self._deadline)
+
+    def makefile(self, mode: str):
+        # The unbuffered file retains the real socket's reference until the
+        # response is closed, including HTTP/1.0 / Connection: close responses.
+        raw = self._sock.makefile(mode, buffering=0)
+        return io.BufferedReader(_DeadlineReader(raw, self._sock, self._deadline))
+
+    def close(self) -> None:
+        self._sock.close()
 
 
 def validate_secret(secret: str) -> bytes:
@@ -148,10 +242,14 @@ def _require_public_address(address: str) -> None:
 class _PublicHTTPSConnection(http.client.HTTPSConnection):
     """Resolve once per connection, validate the entire set, and pin its IP."""
 
+    def __init__(self, *args, deadline: float | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+
     def connect(self) -> None:
         if self._tunnel_host is not None:
             raise ValueError("webhook proxy tunnels are not supported")
-        addresses = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        addresses = _resolve(self.host, self.port, self._deadline)
         if not addresses:
             raise OSError("callback hostname resolved to no addresses")
         for family, socktype, proto, canonname, sockaddr in addresses:
@@ -162,14 +260,19 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
         # create_connection(hostname) here would introduce DNS rebinding.
         last_error = None
         for family, socktype, proto, canonname, sockaddr in addresses:
+            _remaining(self._deadline)
             raw_socket = socket.socket(family, socktype, proto)
+            connected_socket = raw_socket
             try:
-                raw_socket.settimeout(self.timeout)
+                raw_socket.settimeout(_remaining(self._deadline))
                 raw_socket.connect(sockaddr)
-                self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+                raw_socket.settimeout(_remaining(self._deadline))
+                connected_socket = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+                _remaining(self._deadline)
+                self.sock = _DeadlineSocket(connected_socket, self._deadline)
                 return
             except OSError as exc:
-                raw_socket.close()
+                connected_socket.close()
                 last_error = exc
         assert last_error is not None
         raise last_error
@@ -189,8 +292,11 @@ class PublicWebhookTransport:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and positive")
         self.timeout = timeout
+        # Load the local trust store once, before any timed delivery starts.
+        self._context = ssl.create_default_context()
 
     def post(self, url: str, body: bytes, headers: Mapping[str, str]) -> tuple[int, bytes]:
+        deadline = time.monotonic() + self.timeout
         parsed = validate_callback_url(url)
         if not isinstance(body, bytes):
             raise TypeError("body must be bytes")
@@ -199,20 +305,29 @@ class PublicWebhookTransport:
         # Keep Host and framing bound to the validated URL and exact body.
         if any(name.lower() in {"host", "content-length", "transfer-encoding", "connection"} for name in headers):
             raise ValueError("webhook headers cannot override host or HTTP framing")
-        context = ssl.create_default_context()
+        _remaining(deadline)
         connection = _PublicHTTPSConnection(
-            parsed.hostname, parsed.port or 443, timeout=self.timeout, context=context
+            parsed.hostname, parsed.port or 443, timeout=self.timeout, context=self._context, deadline=deadline
         )
         target = parsed.path or "/"
         if parsed.query:
             target += "?" + parsed.query
+        response = None
         try:
+            _remaining(deadline)
             connection.request("POST", target, body=body, headers=dict(headers))
+            _remaining(deadline)
             response = connection.getresponse()
+            _remaining(deadline)
             response_body = response.read(MAX_RESPONSE_BYTES + 1)
+            _remaining(deadline)
             if len(response_body) > MAX_RESPONSE_BYTES:
                 raise ValueError("webhook response exceeds 64 KiB")
             # In particular, 3xx is returned as-is; no redirect is ever followed.
             return response.status, response_body
         finally:
-            connection.close()
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()

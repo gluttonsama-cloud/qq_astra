@@ -1,0 +1,13 @@
+{
+  "public_resource_url": "https://bridge.example.invalid/mcp",
+  "oauth_issuer": "https://identity.example.invalid/",
+  "owner_subject": "REPLACE_WITH_VERIFIED_OAUTH_SUBJECT",
+  "jwks_file": "./public-jwks.json",
+  "onebot_url": "http://127.0.0.1:3000",
+  "onebot_token_file": "./private/onebot.token",
+  "state_key_file": "./private/state.key",
+  "account_id": 0,
+  "peer_id": 0,
+  "listen_port": 8765,
+  "max_messages": 10000
+}

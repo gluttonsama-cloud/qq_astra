@@ -1,8 +1,10 @@
 """Offline tests only: all DNS, sockets, TLS, and HTTP delivery are mocked."""
 
 import base64
+import io
 import socket
 import ssl
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -101,6 +103,7 @@ class ConnectionTests(unittest.TestCase):
         self.context = MagicMock(spec=ssl.SSLContext)
         self.context.verify_mode = ssl.CERT_REQUIRED
         self.context.check_hostname = True
+        self.context.wrap_socket.return_value.send.side_effect = len
 
     def connection(self):
         return webhooks._PublicHTTPSConnection("callbacks.example.test", 443, timeout=3, context=self.context)
@@ -149,9 +152,9 @@ class ConnectionTests(unittest.TestCase):
         connection.connect()
         resolve.assert_called_once_with("callbacks.example.test", 443, type=socket.SOCK_STREAM)
         raw_socket.connect.assert_called_once_with(("8.8.8.8", 443))
-        raw_socket.settimeout.assert_called_once_with(3)
+        self.assertTrue(all(0 < call.args[0] <= 3 for call in raw_socket.settimeout.call_args_list))
         self.context.wrap_socket.assert_called_once_with(raw_socket, server_hostname="callbacks.example.test")
-        self.assertIs(connection.sock, self.context.wrap_socket.return_value)
+        self.assertIs(connection.sock._sock, self.context.wrap_socket.return_value)
 
     @patch.object(webhooks.socket, "socket")
     @patch.object(webhooks.socket, "getaddrinfo")
@@ -176,10 +179,26 @@ class ConnectionTests(unittest.TestCase):
     def test_original_host_header_is_sent_with_pinned_connection(self, resolve, socket_factory):
         connection = self.connection()
         connection.request("POST", "/events", body=BODY, headers={"Content-Type": "application/json"})
-        wire = b"".join(call.args[0] for call in connection.sock.sendall.call_args_list)
+        wire = b"".join(call.args[0] for call in self.context.wrap_socket.return_value.send.call_args_list)
         self.assertIn(b"Host: callbacks.example.test\r\n", wire)
         self.assertNotIn(b"Host: 8.8.8.8", wire)
         self.assertTrue(wire.endswith(BODY))
+
+    @patch.object(webhooks.socket, "socket")
+    @patch.object(webhooks.socket, "getaddrinfo", return_value=[address()])
+    def test_deadline_stream_parses_close_and_chunked_responses(self, resolve, socket_factory):
+        responses = [b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"]
+        for wire in responses:
+            with self.subTest(wire=wire):
+                self.context.wrap_socket.return_value.makefile.return_value = io.BytesIO(wire)
+                connection = self.connection()
+                try:
+                    connection.request("POST", "/events", body=BODY)
+                    with connection.getresponse() as response:
+                        self.assertEqual(response.read(65537), b"{}")
+                finally:
+                    connection.close()
 
 
 class TransportTests(unittest.TestCase):
@@ -249,6 +268,103 @@ class TransportTests(unittest.TestCase):
         for timeout in (0, -1, float("inf"), float("nan")):
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):
                 webhooks.PublicWebhookTransport(timeout)
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_dns_timeout_keeps_slot_until_resolver_really_exits(self):
+        entered, release = threading.Event(), threading.Event()
+        slots = threading.BoundedSemaphore(1)
+
+        def blocked_dns(*args, **kwargs):
+            entered.set()
+            release.wait(2)
+            return [address()]
+
+        with patch.object(webhooks, "_DNS_SLOTS", slots), patch.object(webhooks.socket, "getaddrinfo", side_effect=blocked_dns) as resolve:
+            try:
+                started = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    webhooks._resolve("callbacks.example.test", 443, started + 0.03)
+                self.assertTrue(entered.is_set())
+                self.assertLess(time.monotonic() - started, 0.5)
+                with self.assertRaisesRegex(TimeoutError, "capacity"):
+                    webhooks._resolve("callbacks.example.test", 443, time.monotonic() + 0.03)
+                self.assertEqual(resolve.call_count, 1)
+            finally:
+                release.set()
+                self.assertTrue(slots.acquire(timeout=1))
+                slots.release()
+
+    def test_address_fallback_uses_one_total_deadline(self):
+        clock = [100.0]
+        raw = MagicMock()
+
+        def slow_connect(sockaddr):
+            clock[0] = 101.1
+            raise TimeoutError("fixture connect timeout")
+
+        raw.connect.side_effect = slow_connect
+        with patch.object(webhooks.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(webhooks, "_resolve", return_value=[address(), address("1.1.1.1")]), \
+             patch.object(webhooks.socket, "socket", return_value=raw) as factory:
+            connection = webhooks._PublicHTTPSConnection("callbacks.example.test", 443, timeout=1)
+            with self.assertRaises(TimeoutError):
+                connection.connect()
+        factory.assert_called_once()
+        raw.close.assert_called_once()
+
+    def test_slow_trickle_reads_cannot_reset_total_deadline(self):
+        clock = [100.0]
+        sock = MagicMock()
+
+        class Trickle(io.RawIOBase):
+            def readable(self):
+                return True
+
+            def readinto(self, buffer):
+                clock[0] += 0.4
+                buffer[0] = ord("x")
+                return 1
+
+        with patch.object(webhooks.time, "monotonic", side_effect=lambda: clock[0]):
+            with io.BufferedReader(webhooks._DeadlineReader(Trickle(), sock, 101.0)) as reader:
+                with self.assertRaises(TimeoutError):
+                    reader.readline()  # Same path used for HTTP headers and chunks.
+        budgets = [call.args[0] for call in sock.settimeout.call_args_list]
+        self.assertEqual(len(budgets), 3)
+        self.assertGreater(budgets[0], budgets[1])
+        self.assertGreater(budgets[1], budgets[2])
+
+    def test_partial_writes_cannot_reset_total_deadline(self):
+        clock = [100.0]
+        sock = MagicMock()
+
+        def slow_send(data):
+            clock[0] += 0.6
+            return 1
+
+        sock.send.side_effect = slow_send
+        with patch.object(webhooks.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(TimeoutError):
+                webhooks._DeadlineSocket(sock, 101.0).sendall(b"three bytes")
+        self.assertEqual(sock.send.call_count, 2)
+
+    @patch.object(webhooks, "_PublicHTTPSConnection")
+    def test_expired_response_is_rejected_and_closed(self, connection_class):
+        clock = [100.0]
+        connection = connection_class.return_value
+        response = connection.getresponse.return_value
+
+        def read_after_deadline(limit):
+            clock[0] = 101.1
+            return b"late response"
+
+        response.read.side_effect = read_after_deadline
+        with patch.object(webhooks.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(TimeoutError):
+                webhooks.PublicWebhookTransport(timeout=1).post(URL, BODY, {})
+        response.close.assert_called_once()
+        connection.close.assert_called_once()
 
 
 if __name__ == "__main__":

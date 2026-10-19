@@ -3,3 +3,8 @@ __pycache__/
 *.sqlite3*
 .venv/
 .env
+private/
+config.json
+*.key
+*.token
+public-jwks.json

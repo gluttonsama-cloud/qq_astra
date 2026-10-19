@@ -11,8 +11,11 @@ import hmac
 import http.client
 import ipaddress
 import json
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
+
+from .webhooks import _DeadlineSocket, _remaining
 
 MAX_BODY = 262144
 
@@ -77,7 +80,7 @@ def decode_event(body, headers, secret, *, account_id, peer_id, now):
 
 
 class LoopbackOneBot:
-    """Explicitly injected adapter for a colocated gateway; not enabled by the CLI.
+    """Configured adapter for a colocated gateway; disabled in the fixture CLI.
 
     Target/account are trusted configuration, never tool arguments. No automatic
     send retry: OneBot send_private_msg has no durable idempotency-key contract.
@@ -101,14 +104,19 @@ class LoopbackOneBot:
         self.account_id, self.peer_id = account_id, peer_id
 
     def _call(self, action, params):
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        deadline = time.monotonic() + 10
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=_remaining(deadline))
+        response = None
         try:
+            conn.connect()
+            conn.sock = _DeadlineSocket(conn.sock, deadline)
             body = json.dumps(params, ensure_ascii=False).encode()
             conn.request("POST", "/" + action, body, {
                 "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
             })
             response = conn.getresponse()
             raw = response.read(65537)
+            _remaining(deadline)
             if len(raw) > 65536 or response.status != 200:
                 raise AmbiguousSend("gateway response unavailable")
             result = json.loads(raw)
@@ -124,6 +132,8 @@ class LoopbackOneBot:
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise AmbiguousSend("gateway outcome unknown") from exc
         finally:
+            if response is not None:
+                response.close()
             conn.close()
 
     def send_text(self, text):

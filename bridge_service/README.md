@@ -1,45 +1,67 @@
-# QQ 桥接服务基础（Draft）
+# QQ 文本桥接服务（Draft）
 
-已实现可复用的持久化服务核心与本机 HTTP 验证入口。**尚未连接真实 QQ、SnowLuma、OAuth 或 dot；不能直接作为生产插件部署。**
+已有可配置运行入口，已验证本机合成闭环。**尚未完成真实 QQ、OAuth 授权、dot 或 Tunnel 联调。** 原始离线示例保留在 `offline_bridge/`。
 
-## 当前范围
+## 范围与运行方式
 
-- SQLite 原子收件去重、持久事件队列、回复状态与固定账号/唯一好友绑定。
-- MCP `server/discover`、`events/list`、订阅/刷新/取消订阅，以及只读状态和受限回复工具。
-- 回调先验 challenge，再按 Standard Webhooks 签名；刷新轮换支持双签名。HTTPS 连接逐次检查并固定公网 IP，保留 TLS 主机验证，不跟随重定向。
-- 事件重试有上限、指数退避和租约隔离；410/413 不重试。2xx 只代表回调收到，不代表 dot 已处理。
-- SnowLuma v2.0.3 的真实 OneBot HTTP 文本格式适配：校验原始报文 HMAC-SHA1、账号及好友 ID；拒绝群聊、临时会话、自发回声、超时消息和非文本段。
-- 回复收件人不可从工具传入，只能来自预绑定好友；每个收件事件最多一条回复。发送前复核网关登录账号。结果不明确或进程中断后标为 uncertain，不盲目重发。
+最小架构是 **Linux 上的 QQ 网关与桥接服务同机，dot 通过 HTTPS 或受支持的 Secure MCP Tunnel 访问桥接服务**。QQ 网关只接受 loopback 地址，不需要公开网关端口。Windows 的 ACL/进程锁尚未实现，当前配置服务不支持 Windows；PC 后备方案仍需适配和验证。
 
-## 本地验证
+已实现：
+- 单一可信 OAuth 主人与唯一 QQ 好友的固定绑定。文本是外部数据，不能授权其他工具；回复工具不接受收件人或任意动作。
+- MCP `2026-07-28` 发现、事件目录、订阅/刷新/取消、状态和受限回复。只保留一个活跃订阅，持续消息可送到该订阅；本账号的同一 dot 实际承接尚待验证。
+- SQLite 持久收件去重、事件重试和回复状态；消息、回复、绑定、回调 URL/secret 使用 Fernet 加密。私密目录、单进程锁、完整性检查和停止时备份。
+- Standard Webhooks challenge、签名和轮换双签名；HTTPS 逐次校验公网 DNS 并固定 IP，验证 TLS，不跟随跳转。DNS、连接、慢速响应均有总截止时间。
+- 单 worker、限流、并发/体积限制、健康检查与优雅停止。SnowLuma v2.0.3 OneBot 文本收发格式、HMAC-SHA1 入站校验和发送前账号复核。
+
+## 本机验证
 
 Python 3.11+，在仓库根目录运行：
 
 ```sh
 python -m venv .venv
 .venv/bin/pip install -r bridge_service/requirements.txt
-.venv/bin/python -m unittest bridge_service.test_service bridge_service.test_webhooks -v
+.venv/bin/python -m unittest bridge_service.test_service bridge_service.test_webhooks bridge_service.test_auth bridge_service.test_state bridge_service.test_runtime -v
 .venv/bin/python -m unittest discover -s offline_bridge -p 'test_*.py' -v
-.venv/bin/python -m bridge_service.server --fixture
 ```
 
-Windows 用 `.venv\Scripts\python` / `pip`。fixture 仅监听 127.0.0.1，使用源码中公开的虚构测试身份，数据库默认置于临时目录。它提供 `/mcp` 与 `/onebot/events`，**外发回调和 QQ 发送都关闭**。不要将此入口公开或接入 Tunnel。
+测试只使用合成账号、临时测试密钥、模拟传输和本机连接。可选 `python -m bridge_service.server --fixture` 是单独的演示入口，使用公开测试身份，外发全部关闭，禁止接入公网或 Tunnel。
 
-不加 `--fixture` 时会拒绝启动。服务测试使用合成消息、模拟回调/网关或本机 HTTP；没有真实 QQ 验签/登录、dot 触发或公网交付的验证记录。原始离线示例保留在 `offline_bridge/`。
+## 配置后启动
 
-## 接入前仍需完成
+`config.example.json` 是故意不能直接启动的模板，不含可用凭据。配置必须由操作者提供；服务不会生成账号、OAuth grant、密钥或 Tunnel。
 
-1. 接入并验证 OAuth 2.1 的可信 principal，与用户明确授权的唯一 QQ 好友绑定。不得从消息正文、昵称或任意请求头推导主人身份。消息内容始终作为外部数据；此服务不提供 shell、通用工具执行或任意收件人发送接口。
-2. 实际部署的认证入口、HTTPS 或 Secure MCP Tunnel、私密状态存储/加密和密钥轮换。当前 SQLite 保存消息及回调 secret，只用于测试；生产需受保护目录、容量/保留策略和备份。生产凭据不能写入仓库。
-3. 单一回复 worker 的生命周期管理、健康监测、限流及进程级请求/DNS 总超时。网络适配器只有 socket 超时。已有 in-flight 请求不能撤回；撤销阻止后续排队交付。
-4. 使用真实账号逐项验证插件发现、订阅、challenge、同一个 dot 接收、QQ 回复和停止订阅，再启用生产启动路径。HTTP harness 不是完整 MCP 客户端互通认证。
+1. 使用已有 OAuth 授权服务器，支持 ChatGPT 的授权流程、PKCE 和资源指示符。配置准确的 issuer、主人 subject、公开 `/mcp` URL，以及可信公钥 JWKS。服务是资源服务器，不是授权服务器。
+2. 配置当前网关的 loopback HTTP 地址、已授权的账号/好友 ID 和既有 token 文件。网关 HTTP 事件 POST 到 `http://127.0.0.1:8765/onebot/events`，原始 JSON 使用该 token 签名；不能配置 quick-operation 回复。端口可改。
+3. 将配置与秘密文件放在仓库外的私密目录。配置、token、既有 Fernet state key 文件需当前用户所有、0400/0600；状态目录0700，数据库0600。JWKS可0644，但不得可被其他用户写入。父路径不得使用符号链接或不可信可写目录。保管好 state key，丢失后无法解密。
+4. 验证配置，再运行服务：
 
-不支持事件历史回放（cursor 始终 null）、多好友/群聊、媒体、语音通话或无来源事件的主动发送。活跃订阅期间已入队的重试可跨重启保留；订阅过期时未交付队列取消，重订阅不会伪造历史回放。网关自身离线漏掉的消息不保证补回。`uncertain` 发送需先核查 QQ 侧记录，再决定是否人工恢复。
+```sh
+python -m bridge_service.runtime --config /private/path/config.json --check
+python -m bridge_service.runtime --config /private/path/config.json
+```
 
-云端或 PC 都可采用“QQ 网关 + 本服务同机，dot 在云端”的结构。`LoopbackOneBot` 只接受明确的本机 HTTP 地址，不包含登录、下载网关、启用插件或公开端口功能。
+`--check` 仅验证配置、认证信任和秘密文件；不验证账号、网关、网络连通或状态目录。真正启动会额外验证状态并取得独占锁。默认监听 `127.0.0.1:8765`，只支持一个进程/worker，不要加 Uvicorn 多 worker 或 reload。SIGINT/SIGTERM 会停止收件、等待当前发送结束并备份。用受信任的进程管理器管理长期运行，当前仓库不安装系统服务。
 
-## 协议来源
+HTTPS 代理/Tunnel 只转发 `/mcp` 和 OAuth protected-resource metadata 路径；**不要转发 `/onebot/events`**。保留公共 Host，转发 Authorization；不信任 X-Forwarded-*。本机 `/healthz` 仅报告队列 worker 是否存活，不证明 QQ 登录或 dot 在线。公网访问、证书、Tunnel 和插件配置仍由操作者接入。
 
-- [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)：按 `2026-07-28` 集成文档实现；CallbackEndpointError 使用该文档的 -32015。draft MCP 上游可能变动，真实客户端互通仍待验证。
-- [Standard Webhooks Python](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/python)：签名直接使用官方库，无自创兼容算法。
-- [SnowLuma HTTP 上报签名](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/network/http-post-adapter.ts)、[私聊事件](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/event-converter/to-message.ts)、[私聊发送](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/message.ts)、[登录账号查询](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/info.ts)：静态源码对齐，不代表实际登录联调通过。
+### OAuth 与状态约束
+
+- 仅接收 `typ=at+jwt` 或 `application/at+jwt` 的 RS256/ES256 access token，严格校验签名、issuer、单一精确 audience、固定 subject、时间和 scope。持久身份同时绑定 issuer、resource 与 subject，改变其中任一项不能复用旧状态。通用 `typ=JWT`、ID token、opaque token 不支持；身份提供方必须匹配此配置。
+- `qq:read` 用于发现/目录/状态，`qq:events` 用于订阅，`qq:reply` 用于回复。公钥文件每次校验重读，原子替换支持公钥轮换。服务不下载不受信任的 token 内 JWKS URL。
+- 生产订阅最多持续1小时，并且不能超过创建/刷新 access token 的有效期。没有 OAuth introspection；已创建的订阅在租约内仍有效，停服务或本地撤销绑定可立即阻止后续工作。已开始的网络发送无法撤回。
+- 默认状态路径为 `$XDG_STATE_HOME/qq-astra` 或 `~/.local/state/qq-astra`，需本机可靠 SQLite/flock 文件系统。自动保留最多10,000条收件，可用 `max_messages` 调至1–100,000；达到上限会拒绝新消息，不暗中删数据。暂不提供保留期清理或密钥迁移。
+- 正常重启自动恢复已提交队列；中断的 QQ 发送标记 `uncertain`，不重发。停止备份为 `bridge.backup.sqlite3`；损坏时保留原库和 sidecar，拒绝启动，不自动用旧备份覆盖。人工恢复需停服务、保留原文件、验证备份及同一 state key/绑定。加密不隐藏数量、时序等元数据，也不防御已控制服务账号的攻击者。
+
+## 明确限制与下一步
+
+仅支持好友私聊文本：入站最多64KB文字，回复最多16KB；媒体、文件、群聊、实时语音、主动无来源消息尚未实现。每个收到的事件最多一条回复；延迟回复可在该事件上完成，但不是无限次多消息会话发送接口。
+
+事件无历史回放（cursor 为 null）；订阅过期的未交付任务取消。活跃租约内重试最多5次；410/413等终止，不把2xx当作 dot 已处理。网关自身漏报不能补回。QQ 发送只有明确成功确认才标记 confirmed，结果不明需先核查 QQ 记录，不能盲目重发。
+
+接下来必须用真实配置验证：OAuth 授权与发现 → 订阅 challenge → 同一 dot 收到私聊事件 → 受限回复 → 取消订阅/重启。当前本地测试通过不能替代这一记录，也未注册、部署或启用任何真实插件。
+
+## 主要来源
+
+- [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events) 与 [插件认证](https://developers.openai.com/plugins/build/auth)：2026-07-28 集成；CallbackEndpointError 使用该文档的 -32015。
+- [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/python)、[PyJWT](https://pyjwt.readthedocs.io/en/stable/api.html)、[JWT access token 类型](https://www.rfc-editor.org/rfc/rfc9068.html)。
+- SnowLuma v2.0.3：[HTTP 签名](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/network/http-post-adapter.ts)、[私聊事件](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/event-converter/to-message.ts)、[发送](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/message.ts)、[账号查询](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/info.ts)。只做静态源码对齐，未运行网关。
