@@ -297,7 +297,7 @@ class _PinnedDirectories:
         self.handles.clear()
 
 
-def _file_handle(chain, name, *, create=False, read=False, writable=False, inherited_ok=False):
+def _file_handle(chain, name, *, create=False, read=False, writable=False, inherited_ok=False, rename=False):
     api = chain.api
     path = ntpath.join(chain.text, _component(name))
     access = api.con.READ_CONTROL | FILE_READ_ATTRIBUTES
@@ -305,7 +305,9 @@ def _file_handle(chain, name, *, create=False, read=False, writable=False, inher
         access |= api.con.GENERIC_READ
     if writable:
         access |= api.con.GENERIC_WRITE
-    sharing = api.con.FILE_SHARE_READ | (0 if read else api.con.FILE_SHARE_WRITE)
+    if rename:
+        access |= api.con.DELETE
+    sharing = api.con.FILE_SHARE_READ | (0 if read or rename else api.con.FILE_SHARE_WRITE)
     try:
         handle = api.file.CreateFile(path, access, sharing, _attributes(api, directory=False) if create else None,
                                      api.con.CREATE_NEW if create else api.con.OPEN_EXISTING,
@@ -329,6 +331,56 @@ def _file_handle(chain, name, *, create=False, read=False, writable=False, inher
         if isinstance(exc, WindowsStateError):
             exc.operation = "validate_private_file"
         raise
+
+
+def _rename_same_directory(handle, destination_name):
+    """Rename the open source within its existing directory, without reopening it.
+
+    NtSetInformationFile + FileRenameInformation accepts a simple name with a
+    NULL RootDirectory. Unlike SetFileInformationByHandle, it does not resolve
+    that name against the process working directory. MoveFileEx reopens the
+    target directory for write access and conflicts with our retained pins.
+    No directory handle is closed or granted additional sharing here.
+
+    https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetinformationfile
+    """
+    import ctypes
+
+    encoded = _component(destination_name).encode("utf-16-le")
+
+    class RenameInformation(ctypes.Structure):
+        _fields_ = [("ReplaceIfExists", ctypes.c_ubyte), ("RootDirectory", ctypes.c_void_p),
+                    ("FileNameLength", ctypes.c_uint32),
+                    ("FileName", ctypes.c_uint16 * (len(encoded) // 2 + 1))]
+
+    class IOStatusBlock(ctypes.Structure):
+        # The first native field is a union of NTSTATUS and a pointer.
+        _fields_ = [("StatusOrPointer", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    info = RenameInformation()
+    info.ReplaceIfExists = 1
+    info.RootDirectory = None
+    info.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(info) + RenameInformation.FileName.offset, encoded, len(encoded))
+    iosb = IOStatusBlock()
+    try:
+        native = ctypes.WinDLL("ntdll")
+        rename = native.NtSetInformationFile
+        rename.argtypes = [ctypes.c_void_p, ctypes.POINTER(IOStatusBlock), ctypes.c_void_p,
+                           ctypes.c_uint32, ctypes.c_int]
+        rename.restype = ctypes.c_int32
+        # _file_handle uses a synchronous handle; this call completes before
+        # the buffer or handle is released. FileRenameInformation is class 10.
+        status = rename(int(handle), ctypes.byref(iosb), ctypes.byref(info), ctypes.sizeof(info), 10)
+        if status != 0:
+            convert = native.RtlNtStatusToDosError
+            convert.argtypes, convert.restype = [ctypes.c_int32], ctypes.c_uint32
+            raise WindowsStateError("atomic private backup publication failed", code="native_file_error",
+                                    operation="publish_backup", winerror=int(convert(status)))
+    except (OSError, AttributeError) as exc:
+        raise WindowsStateError("native private backup publication is unavailable", code="native_file_error",
+                                operation="publish_backup", winerror=getattr(exc, "winerror", None)) from None
 
 
 class WindowsPrivateDirectory:
@@ -412,19 +464,22 @@ class WindowsPrivateDirectory:
         _component(destination_name)
         if source_name not in self._temporary_names or destination_name != "bridge.backup.sqlite3":
             raise WindowsStateError("only this instance's temporary backup may replace its backup file")
-        handle = _file_handle(chain, source_name, writable=True)
+        handle = _file_handle(chain, source_name, writable=True, rename=True)
         try:
+            self.check_file(destination_name, missing_ok=True)
             chain.api.file.FlushFileBuffers(handle)
-        finally:
-            handle.Close()
-        self.check_file(destination_name, missing_ok=True)
-        try:
-            chain.api.file.MoveFileEx(ntpath.join(chain.text, source_name), ntpath.join(chain.text, destination_name),
-                                     chain.api.file.MOVEFILE_REPLACE_EXISTING | chain.api.file.MOVEFILE_WRITE_THROUGH)
+            _rename_same_directory(handle, destination_name)
+            # Verify the same source object at its new name before releasing
+            # its no-write/no-delete-sharing handle. All ancestor pins remain.
+            _validate_handle(chain.api, handle, ntpath.join(chain.text, destination_name),
+                             directory=False, volume=chain.volume)
+            _private_acl(chain.api, handle)
+            chain.api.file.FlushFileBuffers(handle)
         except chain.api.types.error as exc:
             raise WindowsStateError("atomic private backup publication failed", code="native_file_error",
                                     operation="publish_backup", winerror=exc.winerror) from None
-        self.check_file(destination_name)
+        finally:
+            handle.Close()
         return self.path / destination_name
 
     def unlink_file(self, name):

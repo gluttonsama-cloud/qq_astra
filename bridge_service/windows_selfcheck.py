@@ -180,9 +180,60 @@ except StateLocked:
                 backup = state.backup()
                 with closing(sqlite3.connect(backup)) as saved:
                     assert saved.execute("SELECT value FROM fixture").fetchone()[0] == "synthetic fixture"
-        with StateDirectory(state_path):
-            pass
-        report["checks"].append("WAL backup and lock release/reopen")
+                # A real reader which denies delete sharing must preserve the
+                # old backup. Publication must fail closed, then allow retry.
+                stage = "backup_reader_collision"
+                old_backup = backup.read_bytes()
+                db.execute("UPDATE fixture SET value='second committed fixture'")
+                db.commit()
+                reader = win32file.CreateFile(str(backup), win32con.GENERIC_READ,
+                    win32con.FILE_SHARE_READ, None, win32con.OPEN_EXISTING,
+                    win32con.FILE_ATTRIBUTE_NORMAL | win32file.FILE_FLAG_OPEN_REPARSE_POINT, None)
+                try:
+                    try:
+                        state.backup()
+                    except StateError as exc:
+                        assert exc.windows_details["operation"] == "publish_backup"
+                        # NTFS can report ACCESS_DENIED for an open replacement
+                        # target, rather than SHARING_VIOLATION. Either must
+                        # leave the old backup intact and permit a later retry.
+                        assert exc.windows_details["winerror"] in (5, 32)
+                        report["backup_reader_rejection"] = exc.windows_details
+                    else:
+                        raise AssertionError("backup replaced while a reader denied delete sharing")
+                finally:
+                    reader.Close()
+                assert backup.read_bytes() == old_backup, "failed publication changed the old backup"
+                assert db.execute("SELECT value FROM fixture").fetchone()[0] == "second committed fixture"
+                assert not list(state_path.glob(".backup-*")), "failed backup left temporary files"
+                report["checks"].append("sharing conflict preserves old backup/source and cleans temporary files")
+                stage = "backup_replace_and_reopen"
+                state.backup()
+                with closing(sqlite3.connect(backup)) as saved:
+                    assert saved.execute("SELECT value FROM fixture").fetchone()[0] == "second committed fixture"
+                    assert saved.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        with StateDirectory(state_path) as reopened:
+            with closing(sqlite3.connect(reopened.db_path)) as db:
+                assert db.execute("SELECT value FROM fixture").fetchone()[0] == "second committed fixture"
+        report["checks"].append("first/replacement WAL backup, retry, integrity and lock release/reopen")
+
+        stage = "reject_hardlinked_backup"
+        backup_alias = root / "backup-hardlink.sqlite3"
+        previous_backup = backup.read_bytes()
+        os.link(backup, backup_alias)
+        try:
+            with StateDirectory(state_path) as state:
+                try:
+                    state.backup()
+                except StateError:
+                    pass
+                else:
+                    raise AssertionError("hard-linked backup target was accepted")
+            assert backup.read_bytes() == previous_backup
+            assert backup_alias.read_bytes() == previous_backup
+        finally:
+            backup_alias.unlink()
+        report["checks"].append("hard-linked backup target rejected before publication")
 
         stage = "reject_reparse"
         reparse = root / "reparse"
@@ -202,6 +253,26 @@ except StateLocked:
             finally:
                 reparse.unlink()
             report["checks"].append("reparse directory rejected")
+            stage = "reject_reparse_backup"
+            reparse_state = root / "reparse-backup-state"
+            with WindowsPrivateDirectory(reparse_state):
+                pass
+            reparse_backup = reparse_state / StateDirectory.BACKUP_NAME
+            original_backup = backup.read_bytes()
+            os.symlink(backup, reparse_backup)
+            try:
+                with StateDirectory(reparse_state) as state:
+                    try:
+                        state.backup()
+                    except StateError:
+                        pass
+                    else:
+                        raise AssertionError("reparse backup target was accepted")
+                assert backup.read_bytes() == original_backup
+                assert reparse_backup.is_symlink()
+            finally:
+                reparse_backup.unlink()
+            report["checks"].append("reparse backup target rejected without modifying its referent")
         report["status"] = "partial" if report["not_tested"] else "passed"
     except Exception as exc:
         report["status"] = "failed"

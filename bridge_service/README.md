@@ -57,7 +57,7 @@ HTTPS 代理/Tunnel 只转发 `/mcp` 和 OAuth protected-resource metadata 路�
 
 增量验证：`python -m unittest bridge_service.test_webhooks bridge_service.test_proxy_webhooks -v`。使用模拟 socket、合成回调地址与固定测试数据；不接触真实账号、网络代理或 Windows ACL。
 
-### Windows PC 网关后备（验收未通过）
+### Windows PC 网关后备（本机存储自检已通过；端到端未验收）
 
 QQ 网关与桥接均在 PC 上，dot 仍在云端。使用本地固定 NTFS 盘和普通用户 Python 3.11+；暂不支持 UNC/网络盘、SUBST、重解析目录、OneDrive占位文件和长路径。PC 必须在线；本项目不改防火墙、不安装系统服务、不公开 QQ 网关。Windows 使用 Ctrl+C 正常停止；关闭窗口、强制结束或断电可能硬中断，不能保证生成最后一份备份，重启按已提交状态恢复。
 
@@ -86,7 +86,9 @@ py -3 -m venv .venv
 
 自检通过后，操作者可另行把私密项目目录选为 `%USERPROFILE%\qq-astra`，使用已有 `--prepare-windows-directory` 入口准备，再将配置和已有秘密文件放入其中。配置需显式设置 `"state_dir": "./state"`，让状态位于该私密目录下；仅移动 `config.json` 不会改变默认状态位置。此处不会自动搬迁现有状态或改动 AppData/Local 的 ACL。
 
-2026-10-20 的 Windows x64 / Python 3.13.3 原生检查：用户主目录下的新建临时目录通过私密/继承 ACL、宽/NULL DACL 拒绝、硬链接拒绝、目录写入/重命名保护和双进程锁。备份发布在 `MoveFileEx` 返回 `winerror=32`，重开和重解析点检查未完成。独立合成样本确认：保护句柄打开时重命名文件失败，关闭后成功。当前保留目录保护语义，未放开写入共享；须解决该冲突后才能完整验收。测试目录均已清理。自检已修正硬链接样本创建时机，并保证 SQLite 连接在异常路径关闭。
+2026-10-20 在 Windows x64 / Python 3.13.3 原生验收：用户根目录下的新建临时目录通过全部十组自检，包括私密/继承 ACL、宽/NULL DACL 拒绝、硬链接拒绝、目录写入/重命名保护、双进程锁、首次和覆盖 WAL 备份、旧备份保留与失败重试、完整性和重开、硬链接备份目标拒绝，以及目录/备份目标的重解析点拒绝。读者禁止删除共享时，发布返回 `winerror=5`，旧备份和源数据库均保留；读者关闭后重试成功。`not_tested` 为空，临时目录清理完成。策略及平台契约另有 21 项测试通过。
+
+备份发布使用 `NtSetInformationFile` 的同目录 `FileRenameInformation`：目标限定为备份文件名，源文件句柄一直保留，发布前后刷新数据并验证同一对象；所有祖先与状态目录的保护句柄持续开启，未放宽共享模式或 ACL 信任范围。重开和失败恢复已验证，但未进行断电测试，不保证强制终止/断电时最后一次目录元数据提交。该结果只覆盖本机存储实现，不代表 QQ 登录、OAuth、云端 dot 回调或端到端通信已经验收。
 
 ### OAuth 与状态约束
 
