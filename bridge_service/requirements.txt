@@ -3,3 +3,4 @@ PyJWT[crypto]==2.15.1
 cryptography==50.0.2
 uvicorn==0.52.1
 pywin32==312; sys_platform == 'win32'
+Pillow==13.0.0

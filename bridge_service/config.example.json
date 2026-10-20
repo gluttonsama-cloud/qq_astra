@@ -11,5 +11,7 @@
   "peer_id": 0,
   "listen_port": 8765,
   "max_messages": 10000,
-  "webhook_proxy_url": null
+  "webhook_proxy_url": null,
+  "media_proxy_url": null,
+  "file_download_hosts": []
 }

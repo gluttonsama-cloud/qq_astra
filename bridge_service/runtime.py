@@ -14,6 +14,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import uvicorn
+from .media import ImageFetcher, file_hosts
+from .media_tools import TOOL_SCOPES
 
 from .auth import Authenticator, AuthError
 from .core import Bridge, RpcError, canonical
@@ -40,6 +42,7 @@ class QueueWorker:
         try:
             while not self.stop_event.is_set():
                 worked = self.bridge.dispatch_reply()
+                worked = self.bridge.operations.dispatch() or worked
                 if self.stop_event.is_set():
                     break
                 worked = self.bridge.dispatch_event() or worked
@@ -188,6 +191,9 @@ class Application:
                     required_scope = "qq:events"
                 elif method_name == "tools/call" and isinstance(params, dict) and params.get("name") == "qq_reply":
                     required_scope = "qq:reply"
+                elif (method_name == "tools/call" and isinstance(params, dict)
+                      and isinstance(params.get("name"), str) and params["name"] in TOOL_SCOPES):
+                    required_scope = TOOL_SCOPES[params["name"]]
             _, expires_at = await asyncio.to_thread(self.auth.authenticate_with_expiry, headers.get("authorization"), required_scope)
             principal = self.auth.binding_principal
             if headers.get("mcp-protocol-version") not in (None, "2026-07-28"):
@@ -212,7 +218,8 @@ class Application:
             if (exc.status_code in (401, 403) and isinstance(request, dict)
                     and request.get("jsonrpc") == "2.0" and type(request.get("id")) in (str, int)
                     and request.get("method") == "tools/call" and isinstance(request.get("params"), dict)
-                    and request["params"].get("name") in ("bridge_status", "qq_reply")
+                    and isinstance(request["params"].get("name"), str)
+                    and request["params"]["name"] in {"bridge_status", "qq_reply", *TOOL_SCOPES}
                     and isinstance(request["params"].get("arguments", {}), dict)):
                 return await self._respond(send, 200, {"jsonrpc": "2.0", "id": request["id"], "result": {
                     "isError": True, "content": [{"type": "text", "text": "Authorization is required for this tool."}],
@@ -249,7 +256,7 @@ def load_config(path):
     required = {"public_resource_url", "oauth_issuer", "owner_subject", "onebot_url",
                 "onebot_token_file", "state_key_file", "account_id", "peer_id"}
     optional = {"state_dir", "listen_port", "max_messages", "webhook_proxy_url", "jwks_file",
-                "jwks_from_issuer", "jwks_proxy_url", "secure_mcp_tunnel"}
+                "jwks_from_issuer", "jwks_proxy_url", "secure_mcp_tunnel", "file_download_hosts", "media_proxy_url"}
     if not isinstance(config, dict) or not required <= config.keys() or config.keys() - required - optional:
         raise ValueError("missing or unknown configuration fields")
     validate_callback_url(config["public_resource_url"])
@@ -274,6 +281,8 @@ def load_config(path):
 
 def validate_configuration(config):
     validate_proxy_url(config.get("webhook_proxy_url"))
+    validate_proxy_url(config.get("media_proxy_url"))
+    file_hosts(config.get("file_download_hosts", []))
     _validate_auth_options(config)
     auth = Authenticator(issuer=config["oauth_issuer"], public_resource_url=config["public_resource_url"],
                          owner_subject=config["owner_subject"], jwks_path=config.get("jwks_file"),
@@ -297,6 +306,7 @@ def create_application(config):
         bridge = Bridge(state.db_path, principal=auth.binding_principal, account_id=config["account_id"],
                         peer_id=config["peer_id"], cipher=cipher, production_auth_ready=True,
                         max_messages=config.get("max_messages", 10000),
+                        media_fetcher=ImageFetcher(download_hosts=config.get("file_download_hosts", []), proxy_url=config.get("media_proxy_url")),
                         webhook_transport=PublicWebhookTransport(timeout=10, proxy_url=config.get("webhook_proxy_url")), gateway=gateway)
         return Application(bridge, auth, token, port=config.get("listen_port", 8765), state=state)
     except BaseException:
