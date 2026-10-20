@@ -25,7 +25,16 @@ import uuid
 
 
 class WindowsStateError(RuntimeError):
-    pass
+    def __init__(self, message, *, code="windows_state_rejected", operation=None,
+                 ancestor_index=None, winerror=None, ace_flags=None, rejected_mask=None):
+        super().__init__(message)
+        self.code, self.operation, self.ancestor_index = code, operation, ancestor_index
+        self.winerror, self.ace_flags, self.rejected_mask = winerror, ace_flags, rejected_mask
+
+    def safe_details(self):
+        """Structured local diagnostics; never include a path, SID or native text."""
+        return {name: value for name in ("code", "operation", "ancestor_index", "winerror", "ace_flags", "rejected_mask")
+                if (value := getattr(self, name)) is not None}
 
 
 class WindowsStateLocked(WindowsStateError):
@@ -97,7 +106,8 @@ def validate_ancestor_acl(owner_sid, current_sid, control, aces):
         if mask & GENERIC_EXECUTE:
             mapped |= 0x001200A0
         if mapped & ~safe:
-            raise WindowsStateError("path ancestor allows an untrusted SID to replace or control existing objects")
+            raise WindowsStateError("path ancestor allows an untrusted SID to replace or control existing objects",
+                                    code="ancestor_unsafe_allow", ace_flags=flags, rejected_mask=mapped & ~safe)
 
 
 def _component(name):
@@ -222,6 +232,7 @@ class _PinnedDirectories:
         self.handles = []
         self.volume = None
         self.private_parent = False
+        operation, index = "volume_check", None
         try:
             api = self.api
             drive = ntpath.splitdrive(self.text)[0]
@@ -239,12 +250,14 @@ class _PinnedDirectories:
             for index, current in enumerate(paths):
                 created = False
                 if create and index:
+                    operation = "create_directory"
                     try:
                         api.file.CreateDirectory(current, _attributes(api, directory=True))
                         created = True
                     except api.types.error as exc:
                         if exc.winerror != 183:  # ERROR_ALREADY_EXISTS; never repair its ACL.
                             raise
+                operation = "open_directory"
                 handle = api.file.CreateFile(
                     # Include a real read-access category: metadata-only access
                     # does not reliably participate in Windows sharing checks.
@@ -252,13 +265,17 @@ class _PinnedDirectories:
                     api.con.FILE_SHARE_READ, None, api.con.OPEN_EXISTING,
                     api.con.FILE_FLAG_BACKUP_SEMANTICS | api.file.FILE_FLAG_OPEN_REPARSE_POINT, None)
                 self.handles.append(handle)
+                operation = "validate_directory"
                 info = _validate_handle(api, handle, current, directory=True, volume=self.volume)
                 if self.volume is None:
                     self.volume = info[4]
+                operation = "ancestor_acl"
                 _ancestor_acl(api, handle)
                 if created:
+                    operation = "private_acl"
                     _private_acl(api, handle)
             try:
+                operation = "private_acl"
                 _private_acl(api, self.handles[-1])
                 self.private_parent = True
             except WindowsStateError:
@@ -267,7 +284,11 @@ class _PinnedDirectories:
         except BaseException as exc:
             self.close()
             if isinstance(exc, self.api.types.error):
-                raise WindowsStateError("Windows directory could not be safely opened; check path, ACL and sharing") from None
+                raise WindowsStateError("Windows directory could not be safely opened; check path, ACL and sharing",
+                                        code="native_directory_error", operation=operation,
+                                        ancestor_index=index, winerror=exc.winerror) from None
+            if isinstance(exc, WindowsStateError):
+                exc.operation, exc.ancestor_index = operation, index
             raise
 
     def close(self):
@@ -276,7 +297,7 @@ class _PinnedDirectories:
         self.handles.clear()
 
 
-def _file_handle(chain, name, *, create=False, read=False, writable=False, inherited_ok=False):
+def _file_handle(chain, name, *, create=False, read=False, writable=False, inherited_ok=False, rename=False):
     api = chain.api
     path = ntpath.join(chain.text, _component(name))
     access = api.con.READ_CONTROL | FILE_READ_ATTRIBUTES
@@ -284,7 +305,9 @@ def _file_handle(chain, name, *, create=False, read=False, writable=False, inher
         access |= api.con.GENERIC_READ
     if writable:
         access |= api.con.GENERIC_WRITE
-    sharing = api.con.FILE_SHARE_READ | (0 if read else api.con.FILE_SHARE_WRITE)
+    if rename:
+        access |= api.con.DELETE
+    sharing = api.con.FILE_SHARE_READ | (0 if read or rename else api.con.FILE_SHARE_WRITE)
     try:
         handle = api.file.CreateFile(path, access, sharing, _attributes(api, directory=False) if create else None,
                                      api.con.CREATE_NEW if create else api.con.OPEN_EXISTING,
@@ -294,7 +317,8 @@ def _file_handle(chain, name, *, create=False, read=False, writable=False, inher
             raise FileNotFoundError("private file does not exist") from None
         if create and exc.winerror in (80, 183):
             raise FileExistsError("private file already exists") from None
-        raise WindowsStateError("private file could not be safely opened; check ACL, links and sharing") from None
+        raise WindowsStateError("private file could not be safely opened; check ACL, links and sharing",
+                                code="native_file_error", operation="open_private_file", winerror=exc.winerror) from None
     try:
         _validate_handle(api, handle, path, directory=False, volume=chain.volume)
         _private_acl(api, handle, inherited_ok=inherited_ok and chain.private_parent)
@@ -302,8 +326,61 @@ def _file_handle(chain, name, *, create=False, read=False, writable=False, inher
     except BaseException as exc:
         handle.Close()
         if isinstance(exc, api.types.error):
-            raise WindowsStateError("private file security could not be verified") from None
+            raise WindowsStateError("private file security could not be verified",
+                                    code="native_file_error", operation="validate_private_file", winerror=exc.winerror) from None
+        if isinstance(exc, WindowsStateError):
+            exc.operation = "validate_private_file"
         raise
+
+
+def _rename_same_directory(handle, destination_name):
+    """Rename the open source within its existing directory, without reopening it.
+
+    NtSetInformationFile + FileRenameInformation accepts a simple name with a
+    NULL RootDirectory. Unlike SetFileInformationByHandle, it does not resolve
+    that name against the process working directory. MoveFileEx reopens the
+    target directory for write access and conflicts with our retained pins.
+    No directory handle is closed or granted additional sharing here.
+
+    https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntsetinformationfile
+    """
+    import ctypes
+
+    encoded = _component(destination_name).encode("utf-16-le")
+
+    class RenameInformation(ctypes.Structure):
+        _fields_ = [("ReplaceIfExists", ctypes.c_ubyte), ("RootDirectory", ctypes.c_void_p),
+                    ("FileNameLength", ctypes.c_uint32),
+                    ("FileName", ctypes.c_uint16 * (len(encoded) // 2 + 1))]
+
+    class IOStatusBlock(ctypes.Structure):
+        # The first native field is a union of NTSTATUS and a pointer.
+        _fields_ = [("StatusOrPointer", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+    info = RenameInformation()
+    info.ReplaceIfExists = 1
+    info.RootDirectory = None
+    info.FileNameLength = len(encoded)
+    ctypes.memmove(ctypes.addressof(info) + RenameInformation.FileName.offset, encoded, len(encoded))
+    iosb = IOStatusBlock()
+    try:
+        native = ctypes.WinDLL("ntdll")
+        rename = native.NtSetInformationFile
+        rename.argtypes = [ctypes.c_void_p, ctypes.POINTER(IOStatusBlock), ctypes.c_void_p,
+                           ctypes.c_uint32, ctypes.c_int]
+        rename.restype = ctypes.c_int32
+        # _file_handle uses a synchronous handle; this call completes before
+        # the buffer or handle is released. FileRenameInformation is class 10.
+        status = rename(int(handle), ctypes.byref(iosb), ctypes.byref(info), ctypes.sizeof(info), 10)
+        if status != 0:
+            convert = native.RtlNtStatusToDosError
+            convert.argtypes, convert.restype = [ctypes.c_int32], ctypes.c_uint32
+            raise WindowsStateError("atomic private backup publication failed", code="native_file_error",
+                                    operation="publish_backup", winerror=int(convert(status)))
+    except (OSError, AttributeError) as exc:
+        raise WindowsStateError("native private backup publication is unavailable", code="native_file_error",
+                                operation="publish_backup", winerror=getattr(exc, "winerror", None)) from None
 
 
 class WindowsPrivateDirectory:
@@ -387,18 +464,22 @@ class WindowsPrivateDirectory:
         _component(destination_name)
         if source_name not in self._temporary_names or destination_name != "bridge.backup.sqlite3":
             raise WindowsStateError("only this instance's temporary backup may replace its backup file")
-        handle = _file_handle(chain, source_name, writable=True)
+        handle = _file_handle(chain, source_name, writable=True, rename=True)
         try:
+            self.check_file(destination_name, missing_ok=True)
             chain.api.file.FlushFileBuffers(handle)
+            _rename_same_directory(handle, destination_name)
+            # Verify the same source object at its new name before releasing
+            # its no-write/no-delete-sharing handle. All ancestor pins remain.
+            _validate_handle(chain.api, handle, ntpath.join(chain.text, destination_name),
+                             directory=False, volume=chain.volume)
+            _private_acl(chain.api, handle)
+            chain.api.file.FlushFileBuffers(handle)
+        except chain.api.types.error as exc:
+            raise WindowsStateError("atomic private backup publication failed", code="native_file_error",
+                                    operation="publish_backup", winerror=exc.winerror) from None
         finally:
             handle.Close()
-        self.check_file(destination_name, missing_ok=True)
-        try:
-            chain.api.file.MoveFileEx(ntpath.join(chain.text, source_name), ntpath.join(chain.text, destination_name),
-                                     chain.api.file.MOVEFILE_REPLACE_EXISTING | chain.api.file.MOVEFILE_WRITE_THROUGH)
-        except chain.api.types.error:
-            raise WindowsStateError("atomic private backup publication failed") from None
-        self.check_file(destination_name)
         return self.path / destination_name
 
     def unlink_file(self, name):
@@ -411,8 +492,9 @@ class WindowsPrivateDirectory:
             return
         try:
             chain.api.file.DeleteFile(ntpath.join(chain.text, name))
-        except chain.api.types.error:
-            raise WindowsStateError("temporary private backup could not be removed") from None
+        except chain.api.types.error as exc:
+            raise WindowsStateError("temporary private backup could not be removed", code="native_file_error",
+                                    operation="cleanup_backup", winerror=exc.winerror) from None
 
     def close(self):
         # Never delete the persistent lock file; the handle owns its byte lock.

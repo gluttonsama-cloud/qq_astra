@@ -347,8 +347,17 @@ class StateDirectory:
             result = self._windows.replace_file(temporary.name, self.BACKUP_NAME)
             temporary = None
             return result
-        except (OSError, sqlite3.DatabaseError, WindowsStateError):
-            raise StateError("Windows state backup failed; source database was not replaced") from None
+        except (OSError, sqlite3.DatabaseError, WindowsStateError) as exc:
+            error = StateError("Windows state backup failed; source database was not replaced")
+            if isinstance(exc, WindowsStateError):
+                error.windows_details = exc.safe_details()
+            elif isinstance(exc, OSError):
+                error.windows_details = {"code": "native_backup_error", "errno": exc.errno,
+                                         "winerror": getattr(exc, "winerror", None)}
+            else:
+                error.windows_details = {"code": "sqlite_backup_error",
+                                         "sqlite_errorcode": getattr(exc, "sqlite_errorcode", None)}
+            raise error from None
         finally:
             if temporary is not None:
                 for suffix in ("", "-wal", "-shm", "-journal"):

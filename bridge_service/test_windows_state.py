@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from . import windows_state as ws
+from . import windows_selfcheck as selfcheck
 
 SID = "S-1-5-21-111-222-333-1001"
 PRIVATE = ws.DACL_PRESENT | ws.DACL_PROTECTED
@@ -23,7 +24,7 @@ class Handle:
 def fake_api():
     constants = SimpleNamespace(FILE_ATTRIBUTE_DIRECTORY=0x10, FILE_ATTRIBUTE_REPARSE_POINT=0x400,
                                 FILE_ATTRIBUTE_OFFLINE=0x1000, FILE_SHARE_READ=1, FILE_SHARE_WRITE=2,
-                                FILE_SHARE_DELETE=4, READ_CONTROL=0x20000,
+                                FILE_SHARE_DELETE=4, READ_CONTROL=0x20000, DELETE=0x10000,
                                 GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000,
                                 CREATE_NEW=1, OPEN_EXISTING=3, FILE_ATTRIBUTE_NORMAL=0x80,
                                 FILE_FLAG_BACKUP_SEMANTICS=0x02000000, DRIVE_FIXED=3)
@@ -40,6 +41,60 @@ def fake_api():
 
 
 class WindowsPolicyTests(unittest.TestCase):
+    def test_effective_full_control_is_rejected_even_when_inherited(self):
+        other = "S-1-5-21-444-555-666-1002"
+        for flags in (0, 3, 0x10, 0x13):
+            with self.subTest(flags=flags), self.assertRaises(ws.WindowsStateError) as caught:
+                ws.validate_ancestor_acl(SID, SID, ws.DACL_PRESENT, [(0, flags, ws.FILE_ALL_ACCESS, other)])
+            details = caught.exception.safe_details()
+            self.assertEqual(details["code"], "ancestor_unsafe_allow")
+            self.assertEqual(details["ace_flags"], flags)
+            self.assertTrue(details["rejected_mask"] & 0x40)  # DELETE_CHILD
+            self.assertTrue(details["rejected_mask"] & 0x40000)  # WRITE_DAC
+            self.assertNotIn(other, repr(details))
+            self.assertNotIn(SID, repr(details))
+        for flags in (0x0B, 0x1B):
+            ws.validate_ancestor_acl(SID, SID, ws.DACL_PRESENT, [(0, flags, ws.GENERIC_ALL, other)])
+
+    def test_directory_errors_distinguish_native_sharing_from_acl_policy(self):
+        api = fake_api()
+        api.file.CreateFile.side_effect = api.types.error(32)
+        with patch.object(ws, "_windows", return_value=api), self.assertRaises(ws.WindowsStateError) as caught:
+            ws._PinnedDirectories(r"C:\fixture")
+        self.assertEqual(caught.exception.safe_details(), {"code": "native_directory_error",
+            "operation": "open_directory", "ancestor_index": 0, "winerror": 32})
+        api.file.CreateFile.side_effect = lambda path, *args: Handle(path)
+        api.file.GetFileInformationByHandle = Mock(return_value=[0x10, None, None, None, 17, 0, 0, 1, 0, 1])
+        rejection = ws.WindowsStateError("synthetic", code="ancestor_unsafe_allow", ace_flags=16, rejected_mask=0x40)
+        with patch.object(ws, "_windows", return_value=api), patch.object(ws, "_ancestor_acl", side_effect=rejection), \
+             self.assertRaises(ws.WindowsStateError) as caught:
+            ws._PinnedDirectories(r"C:\fixture")
+        self.assertEqual(caught.exception.operation, "ancestor_acl")
+        self.assertEqual(caught.exception.ancestor_index, 0)
+        self.assertEqual(caught.exception.rejected_mask, 0x40)
+        self.assertNotIn("C:\\", repr(caught.exception.safe_details()))
+
+    def test_selfcheck_parent_is_existing_and_never_repaired(self):
+        with patch.object(selfcheck.Path, "is_dir", return_value=False):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                selfcheck._test_directory(r"C:\missing", "QQAstra-selfcheck-" + "a" * 32)
+            self.assertEqual(caught.exception.code, "selfcheck_parent_missing")
+        with patch.object(selfcheck.Path, "is_dir", return_value=True), patch.object(selfcheck.Path, "exists", return_value=True):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                selfcheck._test_directory(r"C:\existing", "QQAstra-selfcheck-" + "a" * 32)
+            self.assertEqual(caught.exception.code, "selfcheck_path_exists")
+        with self.assertRaises(ws.WindowsStateError):
+            selfcheck._test_directory("relative", "QQAstra-selfcheck-" + "a" * 32)
+
+    def test_selfcheck_cleanup_refuses_root_parent_and_unrelated_directory(self):
+        with patch.object(selfcheck.shutil, "rmtree") as remove:
+            for root, parent in (("C:\\", "C:\\"), (r"C:\existing", r"C:\existing"),
+                                 (r"C:\existing\unrelated", r"C:\existing"),
+                                 (r"C:\other\QQAstra-selfcheck-" + "a" * 32, r"C:\existing")):
+                with self.subTest(root=root), self.assertRaises(OSError):
+                    selfcheck._cleanup_test_directory(root, parent)
+            remove.assert_not_called()
+
     def test_getace_signed_windows_long_is_normalized_at_api_boundary(self):
         acl = SimpleNamespace(GetAceCount=lambda: 1,
                               GetAce=lambda index: ((0, 0), -2147483648, SID))
@@ -192,26 +247,109 @@ class WindowsPolicyTests(unittest.TestCase):
         self.assertTrue(handle.closed)
         directory.close()
 
-    def test_backup_publish_flushes_closes_and_atomically_replaces_only_backup(self):
+    def test_rename_handle_denies_write_and_delete_sharing(self):
         api = fake_api()
-        api.file.MOVEFILE_REPLACE_EXISTING = 1
-        api.file.MOVEFILE_WRITE_THROUGH = 8
+        chain = SimpleNamespace(api=api, text=r"C:\private", volume=17)
+        with patch.object(ws, "_validate_handle"), patch.object(ws, "_private_acl"):
+            handle = ws._file_handle(chain, "fixture", writable=True, rename=True)
+        call = api.file.CreateFile.call_args
+        self.assertTrue(call.args[1] & api.con.DELETE)
+        self.assertTrue(call.args[1] & api.con.GENERIC_WRITE)
+        self.assertEqual(call.args[2], api.con.FILE_SHARE_READ)
+        self.assertFalse(handle.closed)
+        handle.Close()
+
+    def test_native_rename_uses_source_directory_not_working_directory(self):
+        import ctypes
+        native = SimpleNamespace(NtSetInformationFile=Mock(), RtlNtStatusToDosError=Mock(return_value=32))
+        def inspect(handle, iosb, info, length, information_class):
+            self.assertEqual(handle, 77)
+            self.assertEqual(information_class, 10)
+            self.assertIsNone(info._obj.RootDirectory)
+            self.assertEqual(info._obj.ReplaceIfExists, 1)
+            name = "bridge.backup.sqlite3".encode("utf-16-le")
+            self.assertEqual(info._obj.FileNameLength, len(name))
+            self.assertEqual(bytes(info._obj.FileName)[:len(name)], name)
+            self.assertEqual(length, ctypes.sizeof(info._obj))
+            return 0
+        native.NtSetInformationFile.side_effect = inspect
+        with patch.object(ctypes, "WinDLL", return_value=native, create=True) as load:
+            ws._rename_same_directory(77, "bridge.backup.sqlite3")
+            load.assert_called_once_with("ntdll")
+            for name in (r"..\escape", r"C:\escape", "stream:secret", "../escape"):
+                with self.assertRaises(ws.WindowsStateError):
+                    ws._rename_same_directory(77, name)
+            native.NtSetInformationFile.assert_called_once()
+            native.NtSetInformationFile.side_effect = None
+            native.NtSetInformationFile.return_value = -1073741757  # STATUS_SHARING_VIOLATION
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                ws._rename_same_directory(77, "bridge.backup.sqlite3")
+            self.assertEqual(caught.exception.safe_details(), {"code": "native_file_error",
+                "operation": "publish_backup", "winerror": 32})
+
+    def test_backup_publish_retains_source_and_directory_handles_through_validation(self):
+        api = fake_api()
         api.file.FlushFileBuffers = Mock()
-        api.file.MoveFileEx = Mock()
         directory = ws.WindowsPrivateDirectory(r"C:\private")
-        directory._chain = SimpleNamespace(api=api, text=r"C:\private", close=Mock())
+        pin = Handle(r"C:\private")
+        chain = SimpleNamespace(api=api, text=r"C:\private", volume=17, handles=[pin], close=Mock())
+        directory._chain = chain
         directory._temporary_names.add(".backup-fixture.sqlite3")
         handle = Handle()
-        api.file.MoveFileEx.side_effect = lambda *args: self.assertTrue(handle.closed)
-        with patch.object(ws, "_file_handle", return_value=handle), patch.object(directory, "check_file", return_value=True):
+        def check_open(*args, **kwargs):
+            self.assertFalse(handle.closed)
+            self.assertFalse(pin.closed)
+            chain.close.assert_not_called()
+        with patch.object(ws, "_file_handle", return_value=handle) as opened, \
+                patch.object(directory, "check_file", return_value=True) as check, \
+                patch.object(ws, "_rename_same_directory", side_effect=check_open) as rename, \
+                patch.object(ws, "_validate_handle", side_effect=check_open) as validate, \
+                patch.object(ws, "_private_acl", side_effect=check_open):
             directory.replace_file(".backup-fixture.sqlite3", "bridge.backup.sqlite3")
-            api.file.FlushFileBuffers.assert_called_once_with(handle)
-            api.file.MoveFileEx.assert_called_once_with(
-                r"C:\private\.backup-fixture.sqlite3", r"C:\private\bridge.backup.sqlite3", 9)
+            opened.assert_called_once_with(chain, ".backup-fixture.sqlite3", writable=True, rename=True)
+            self.assertEqual(api.file.FlushFileBuffers.call_count, 2)
+            rename.assert_called_once_with(handle, "bridge.backup.sqlite3")
+            validate.assert_called_once_with(api, handle, r"C:\private\bridge.backup.sqlite3", directory=False, volume=17)
+            check.assert_called_once_with("bridge.backup.sqlite3", missing_ok=True)
+            self.assertTrue(handle.closed)
+            self.assertFalse(pin.closed)
+            chain.close.assert_not_called()
             with self.assertRaises(ws.WindowsStateError):
                 directory.replace_file(".backup-fixture.sqlite3", "bridge.sqlite3")
             with self.assertRaises(ws.WindowsStateError):
                 directory.unlink_file("bridge.lock")
+        directory.close()
+
+    def test_backup_sharing_error_reports_only_safe_native_details(self):
+        api = fake_api()
+        api.file.FlushFileBuffers = Mock()
+        directory = ws.WindowsPrivateDirectory(r"C:\private")
+        directory._chain = SimpleNamespace(api=api, text=r"C:\private", close=Mock())
+        directory._temporary_names.add(".backup-fixture.sqlite3")
+        handle = Handle()
+        with patch.object(ws, "_file_handle", return_value=handle), patch.object(directory, "check_file", return_value=True), \
+                patch.object(ws, "_rename_same_directory", side_effect=api.types.error(32)):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                directory.replace_file(".backup-fixture.sqlite3", "bridge.backup.sqlite3")
+            self.assertTrue(handle.closed)
+            self.assertEqual(caught.exception.safe_details(), {"code": "native_file_error",
+                "operation": "publish_backup", "winerror": 32})
+        directory.close()
+
+    def test_unsafe_existing_backup_is_rejected_before_rename(self):
+        api = fake_api()
+        directory = ws.WindowsPrivateDirectory(r"C:\private")
+        directory._chain = SimpleNamespace(api=api, text=r"C:\private", close=Mock())
+        directory._temporary_names.add(".backup-fixture.sqlite3")
+        handle = Handle()
+        with patch.object(ws, "_file_handle", return_value=handle), \
+                patch.object(directory, "check_file", side_effect=ws.WindowsStateError("unsafe target")), \
+                patch.object(ws, "_rename_same_directory") as rename:
+            with self.assertRaises(ws.WindowsStateError):
+                directory.replace_file(".backup-fixture.sqlite3", "bridge.backup.sqlite3")
+            rename.assert_not_called()
+            self.assertTrue(handle.closed)
+            directory._chain.close.assert_not_called()
         directory.close()
 
 
