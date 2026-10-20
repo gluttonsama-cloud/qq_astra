@@ -2,7 +2,8 @@
 
 No connection is made until ``PublicWebhookTransport.post`` is explicitly used.
 A shared monotonic deadline bounds DNS and all network operations, including
-slow-trickle response headers and bodies. No proxy environment variables are used.
+slow-trickle response headers and bodies. Only an explicitly configured local
+HTTP CONNECT proxy is supported; proxy environment variables are never used.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from standardwebhooks import Webhook
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
+MAX_CONNECT_HEADER_BYTES = 16 * 1024
 # Python cannot cancel an OS getaddrinfo call. A timed-out resolver retains its
 # slot until it returns; at most four daemon threads can remain stuck process-wide.
 _DNS_SLOTS = threading.BoundedSemaphore(4)
@@ -239,12 +241,66 @@ def _require_public_address(address: str) -> None:
             raise ValueError("callback must use public IPv6 global-unicast space")
 
 
+def validate_proxy_url(url: str | None) -> tuple[str, int] | None:
+    """Accept only an operator-selected, credential-free loopback HTTP proxy."""
+    if url is None:
+        return None
+    if (not isinstance(url, str) or not url or not url.isascii()
+            or any(ord(c) <= 32 or ord(c) == 127 for c in url)
+            or any(c in url for c in ("\\", "?", "#", "%"))):
+        raise ValueError("invalid webhook proxy URL")
+    try:
+        parsed = urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError("invalid webhook proxy URL") from None
+    if (parsed.scheme != "http" or host not in ("127.0.0.1", "::1")
+            or port is None or not 1 <= port <= 65535
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/")):
+        raise ValueError("webhook proxy must be a credential-free loopback HTTP URL with an explicit port")
+    return host, port
+
+
+def _connect_tunnel(sock, address: str, port: int, deadline: float) -> None:
+    """CONNECT only to a validated numeric target, without reading TLS bytes."""
+    ip = ipaddress.ip_address(address)
+    authority = f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
+    request = f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode("ascii")
+    _DeadlineSocket(sock, deadline).sendall(request)
+    header = bytearray()
+    # One-byte reads avoid consuming tunneled TLS data into an HTTP buffer.
+    # A small bound and one deadline also constrain slow or malicious proxies.
+    while not header.endswith(b"\r\n\r\n"):
+        if len(header) >= MAX_CONNECT_HEADER_BYTES:
+            raise ValueError("proxy CONNECT response headers too large")
+        sock.settimeout(_remaining(deadline))
+        chunk = sock.recv(1)
+        _remaining(deadline)
+        if not chunk:
+            raise OSError("proxy closed before completing CONNECT")
+        header.extend(chunk)
+    lines = bytes(header[:-4]).split(b"\r\n")
+    if not re.fullmatch(rb"HTTP/1\.[01] 200(?: [\x20-\x7e]*)?", lines[0]):
+        raise ValueError("proxy CONNECT did not return HTTP 200")
+    for line in lines[1:]:
+        if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+:[\t\x20-\x7e]*", line):
+            raise ValueError("invalid proxy CONNECT response header")
+        name, value = line.split(b":", 1)
+        # No response body, redirects, proxy authentication or downgrade path.
+        if (name.lower() == b"transfer-encoding"
+                or (name.lower() == b"content-length" and value.strip() != b"0")):
+            raise ValueError("proxy CONNECT response cannot contain a body")
+
+
 class _PublicHTTPSConnection(http.client.HTTPSConnection):
     """Resolve once per connection, validate the entire set, and pin its IP."""
 
-    def __init__(self, *args, deadline: float | None = None, **kwargs) -> None:
+    def __init__(self, *args, deadline: float | None = None,
+                 proxy: tuple[str, int] | None = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._deadline = deadline if deadline is not None else time.monotonic() + self.timeout
+        self._proxy = proxy
 
     def connect(self) -> None:
         if self._tunnel_host is not None:
@@ -261,11 +317,19 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
         last_error = None
         for family, socktype, proto, canonname, sockaddr in addresses:
             _remaining(self._deadline)
+            connect_address = sockaddr
+            if self._proxy is not None:
+                proxy_host, proxy_port = self._proxy
+                family = socket.AF_INET6 if proxy_host == "::1" else socket.AF_INET
+                connect_address = (proxy_host, proxy_port, 0, 0) if family == socket.AF_INET6 else self._proxy
+                socktype, proto = socket.SOCK_STREAM, socket.IPPROTO_TCP
             raw_socket = socket.socket(family, socktype, proto)
             connected_socket = raw_socket
             try:
                 raw_socket.settimeout(_remaining(self._deadline))
-                raw_socket.connect(sockaddr)
+                raw_socket.connect(connect_address)
+                if self._proxy is not None:
+                    _connect_tunnel(raw_socket, sockaddr[0], self.port, self._deadline)
                 raw_socket.settimeout(_remaining(self._deadline))
                 connected_socket = self._context.wrap_socket(raw_socket, server_hostname=self.host)
                 _remaining(self._deadline)
@@ -274,6 +338,9 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
             except OSError as exc:
                 connected_socket.close()
                 last_error = exc
+            except BaseException:
+                connected_socket.close()
+                raise
         assert last_error is not None
         raise last_error
 
@@ -286,12 +353,13 @@ class DisabledWebhookTransport:
 
 
 class PublicWebhookTransport:
-    """Explicit live transport; no redirects, proxies, cookies, or connection reuse."""
+    """Explicit live transport; no ambient proxies, redirects, cookies or reuse."""
 
-    def __init__(self, timeout: float = 10.0) -> None:
+    def __init__(self, timeout: float = 10.0, *, proxy_url: str | None = None) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and positive")
         self.timeout = timeout
+        self._proxy = validate_proxy_url(proxy_url)
         # Load the local trust store once, before any timed delivery starts.
         self._context = ssl.create_default_context()
 
@@ -307,7 +375,8 @@ class PublicWebhookTransport:
             raise ValueError("webhook headers cannot override host or HTTP framing")
         _remaining(deadline)
         connection = _PublicHTTPSConnection(
-            parsed.hostname, parsed.port or 443, timeout=self.timeout, context=self._context, deadline=deadline
+            parsed.hostname, parsed.port or 443, timeout=self.timeout, context=self._context,
+            deadline=deadline, proxy=self._proxy
         )
         target = parsed.path or "/"
         if parsed.query:

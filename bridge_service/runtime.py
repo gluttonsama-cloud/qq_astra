@@ -19,7 +19,7 @@ from .auth import Authenticator, AuthError
 from .core import Bridge, RpcError, canonical
 from .gateway import GatewayRejected, LoopbackOneBot, decode_event
 from .state import StateDirectory, StateCipher, read_secret_file
-from .webhooks import PublicWebhookTransport, validate_callback_url
+from .webhooks import PublicWebhookTransport, validate_callback_url, validate_proxy_url
 
 
 class QueueWorker:
@@ -234,10 +234,11 @@ def load_config(path):
     config = json.loads(raw)
     required = {"public_resource_url", "oauth_issuer", "owner_subject", "jwks_file", "onebot_url",
                 "onebot_token_file", "state_key_file", "account_id", "peer_id"}
-    optional = {"state_dir", "listen_port", "max_messages"}
+    optional = {"state_dir", "listen_port", "max_messages", "webhook_proxy_url"}
     if not isinstance(config, dict) or not required <= config.keys() or config.keys() - required - optional:
         raise ValueError("missing or unknown configuration fields")
     validate_callback_url(config["public_resource_url"])
+    validate_proxy_url(config.get("webhook_proxy_url"))
     url = urlsplit(config["public_resource_url"])
     if url.path != "/mcp" or url.query:
         raise ValueError("public_resource_url must identify the HTTPS /mcp endpoint")
@@ -255,6 +256,7 @@ def load_config(path):
 
 
 def validate_configuration(config):
+    validate_proxy_url(config.get("webhook_proxy_url"))
     auth = Authenticator(issuer=config["oauth_issuer"], public_resource_url=config["public_resource_url"],
                          owner_subject=config["owner_subject"], jwks_path=config["jwks_file"])
     token = read_secret_file(config["onebot_token_file"])
@@ -274,7 +276,7 @@ def create_application(config):
         bridge = Bridge(state.db_path, principal=auth.binding_principal, account_id=config["account_id"],
                         peer_id=config["peer_id"], cipher=cipher, production_auth_ready=True,
                         max_messages=config.get("max_messages", 10000),
-                        webhook_transport=PublicWebhookTransport(timeout=10), gateway=gateway)
+                        webhook_transport=PublicWebhookTransport(timeout=10, proxy_url=config.get("webhook_proxy_url")), gateway=gateway)
         return Application(bridge, auth, token, port=config.get("listen_port", 8765), state=state)
     except BaseException:
         state.__exit__(None, None, None)
