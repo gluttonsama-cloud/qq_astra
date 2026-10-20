@@ -5,24 +5,54 @@ is touched. A non-Windows run explicitly reports NOT TESTED and exits nonzero.
 """
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
 
+from .windows_state import WindowsStateError, validate_local_path
+
+
+def _test_directory(parent, name):
+    """Require an existing explicit parent; never provision or repair it."""
+    parent = Path(validate_local_path(parent))
+    if not parent.is_dir():
+        raise WindowsStateError("selfcheck parent must be an existing directory", code="selfcheck_parent_missing")
+    root = parent / name
+    validate_local_path(root)
+    if root.exists() or root.is_symlink():
+        raise WindowsStateError("selfcheck path already exists", code="selfcheck_path_exists")
+    return root
+
+
+def _cleanup_test_directory(root, parent):
+    root, parent = Path(root), Path(parent)
+    if (not root.is_absolute() or root.parent != parent
+            or not re.fullmatch(r"QQAstra-selfcheck-[0-9a-f]{32}", root.name)
+            or root.resolve(strict=True) != root
+            or root.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError("refusing cleanup outside the named selfcheck directory")
+    shutil.rmtree(root)
+
 
 def main():
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--parent-directory", help="existing local parent for a new disposable test directory; no ACLs are repaired")
+    args = parser.parse_args()
     report = {"platform": sys.platform, "status": "not_tested", "checks": [], "not_tested": []}
     if sys.platform != "win32":
         report["not_tested"] = ["Windows host is required; Linux simulation is not ACL verification"]
         print(json.dumps(report))
         return 2
     root, owned = None, False
+    stage = "dependencies"
     try:
         import pywintypes
         import win32api
@@ -33,11 +63,13 @@ def main():
         from .state import StateDirectory, StateError, StateLocked, read_secret_file
         from .windows_state import DACL_PROTECTED, WindowsPrivateDirectory, default_state_directory
 
-        root = default_state_directory().with_name("QQAstra-selfcheck-" + uuid.uuid4().hex)
-        if root.exists():
-            raise RuntimeError("selfcheck path already exists")
+        stage = "prepare_test_directory"
+        parent = Path(args.parent_directory) if args.parent_directory is not None else default_state_directory().parent
+        root = _test_directory(parent, "QQAstra-selfcheck-" + uuid.uuid4().hex)
+        parent = root.parent
         with WindowsPrivateDirectory(root) as directory:
             owned = True
+            stage = "private_file_acl"
             fixture = directory.create_file("synthetic.txt")
             fixture.write_text("synthetic non-secret fixture", encoding="utf-8")
             assert read_secret_file(fixture) == "synthetic non-secret fixture"
@@ -48,6 +80,7 @@ def main():
             assert read_secret_file(inherited) == "synthetic inherited fixture"
             report["checks"].append("private/protected and private/inherited file ACL reads")
 
+            stage = "reject_broad_and_null_acl"
             token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
             try:
                 sid = win32security.ConvertSidToStringSid(win32security.GetTokenInformation(token, win32security.TokenUser)[0])
@@ -82,19 +115,27 @@ def main():
                     raise AssertionError("unsafe fixture ACL was accepted")
             report["checks"].append("broad and NULL DACL rejected without repairing existing ACL")
 
-            alias = root / "hardlink.txt"
-            os.link(fixture, alias)
+        # Fixture construction must happen after releasing the parent pin.
+        # The actual reader reacquires every pin and must reject the hard link.
+        stage = "create_hardlink_fixture"
+        alias = root / "hardlink.txt"
+        os.link(fixture, alias)
+        try:
+            stage = "reject_hardlink"
             try:
-                try:
-                    read_secret_file(fixture)
-                except StateError:
-                    pass
-                else:
-                    raise AssertionError("hard-linked secret was accepted")
-            finally:
-                alias.unlink()
-            report["checks"].append("hard link rejected")
+                read_secret_file(fixture)
+            except StateError:
+                pass
+            else:
+                raise AssertionError("hard-linked secret was accepted")
+        finally:
+            failed_stage = stage
+            stage = "cleanup_hardlink_fixture"
+            alias.unlink()
+            stage = failed_stage
+        report["checks"].append("hard link rejected")
 
+        stage = "directory_pin"
         original, renamed = root / "pincheck", root / "pincheck-renamed"
         with WindowsPrivateDirectory(original):
             try:
@@ -116,6 +157,7 @@ def main():
         win32file.MoveFileEx(str(original), str(renamed), 0)
         report["checks"].append("directory pin blocks write/rename until its handles close")
 
+        stage = "state_lock"
         state_path = root / "state"
         with StateDirectory(state_path) as state:
             code = """import sys
@@ -130,19 +172,19 @@ except StateLocked:
                 cwd=Path(__file__).resolve().parent.parent, capture_output=True, timeout=15)
             assert child.returncode == 23, "second process did not observe the state lock"
             report["checks"].append("second process rejected by exclusive state lock")
-            with sqlite3.connect(state.db_path) as db:
+            stage = "backup_and_reopen"
+            with closing(sqlite3.connect(state.db_path)) as db:
                 db.execute("CREATE TABLE fixture(value TEXT)")
                 db.execute("INSERT INTO fixture VALUES('synthetic fixture')")
                 db.commit()
                 backup = state.backup()
-                with sqlite3.connect(backup) as saved:
+                with closing(sqlite3.connect(backup)) as saved:
                     assert saved.execute("SELECT value FROM fixture").fetchone()[0] == "synthetic fixture"
-                saved.close()
-            db.close()
         with StateDirectory(state_path):
             pass
         report["checks"].append("WAL backup and lock release/reopen")
 
+        stage = "reject_reparse"
         reparse = root / "reparse"
         try:
             os.symlink(state_path, reparse, target_is_directory=True)
@@ -165,10 +207,17 @@ except StateLocked:
         report["status"] = "failed"
         # Do not echo paths, descriptors, SIDs or arbitrary exception strings.
         report["failure_type"] = type(exc).__name__
+        report["failure_stage"] = stage
+        if isinstance(exc, WindowsStateError):
+            report["details"] = exc.safe_details()
+        elif isinstance(exc, OSError):
+            report["details"] = {"errno": exc.errno, "winerror": getattr(exc, "winerror", None)}
+        elif isinstance(getattr(exc, "windows_details", None), dict):
+            report["details"] = exc.windows_details
     finally:
         if owned:
             try:
-                shutil.rmtree(root)
+                _cleanup_test_directory(root, parent)
             except OSError:
                 report["status"] = "failed"
                 report["not_tested"].append("temporary selfcheck directory cleanup failed")

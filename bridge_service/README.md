@@ -4,7 +4,7 @@
 
 ## 范围与运行方式
 
-最小架构是 **QQ 网关与桥接服务同机，dot 通过 HTTPS 或受支持的 Secure MCP Tunnel 访问桥接服务**。QQ 网关只接受 loopback 地址，不需要公开网关端口。Linux 已做本机验证；Windows 已有候选实现和自检入口，**尚未在 Windows 真机验证，不代表已经可用或接通**。
+最小架构是 **QQ 网关与桥接服务同机，dot 通过 HTTPS 或受支持的 Secure MCP Tunnel 访问桥接服务**。QQ 网关只接受 loopback 地址，不需要公开网关端口。Linux 已做本机验证；Windows 已完成部分原生检查，**备份发布仍有共享冲突，完整验收未通过，不代表已经可用或接通**。
 
 已实现：
 - 单一可信 OAuth 主人与唯一 QQ 好友的固定绑定。文本是外部数据，不能授权其他工具；回复工具不接受收件人或任意动作。
@@ -57,7 +57,7 @@ HTTPS 代理/Tunnel 只转发 `/mcp` 和 OAuth protected-resource metadata 路�
 
 增量验证：`python -m unittest bridge_service.test_webhooks bridge_service.test_proxy_webhooks -v`。使用模拟 socket、合成回调地址与固定测试数据；不接触真实账号、网络代理或 Windows ACL。
 
-### Windows PC 网关后备（待真机验证）
+### Windows PC 网关后备（验收未通过）
 
 QQ 网关与桥接均在 PC 上，dot 仍在云端。使用本地固定 NTFS 盘和普通用户 Python 3.11+；暂不支持 UNC/网络盘、SUBST、重解析目录、OneDrive占位文件和长路径。PC 必须在线；本项目不改防火墙、不安装系统服务、不公开 QQ 网关。Windows 使用 Ctrl+C 正常停止；关闭窗口、强制结束或断电可能硬中断，不能保证生成最后一份备份，重启按已提交状态恢复。
 
@@ -75,6 +75,18 @@ py -3 -m venv .venv
 准备目录后，将模板另存为其中的 `config.json`，填写同一组配置；已有 `public-jwks.json`、`onebot.token` 和 `state.key` 也放在该目录，禁止放进仓库。准备命令不产生密钥或授权。新目录在创建时设置受保护 DACL，仅当前用户、SYSTEM 和 Administrators；已有宽权限目录直接拒绝，不自动修改 ACL。在受保护私密父目录内创建的文件可继承同一严格权限。
 
 自检只在新建、可删除的项目测试目录验证真实 ACL、宽/NULL DACL 拒绝、目录句柄防写入/重命名、双进程锁、SQLite备份/重开和链接拒绝，不读取真实账号/配置。非 Windows 明确返回 `not_tested`；无法创建重解析测试样本会返回 `partial`，不会自动提权或修改开发者模式。只有 Windows 实测结果才能确认此候选支持。
+
+如果默认 `%LOCALAPPDATA%` 路径的祖先 ACL 被拒绝，可显式选择另一个**已有**的本地父目录，例如用户主目录，再运行同一组自检：
+
+```powershell
+.\.venv\Scripts\python.exe -m bridge_service.windows_selfcheck --parent-directory "$env:USERPROFILE"
+```
+
+该选项只决定新建的 `QQAstra-selfcheck-<随机ID>` 临时目录位置，不改变默认状态路径，不创建或修复父目录，不绕过任何 NTFS、祖先 ACL、私密 ACL 或句柄检查。已有目录的继承 ACE 若实际授予额外主体删除子项、修改 DACL 等权限，仍会拒绝；只有 `INHERIT_ONLY` ACE 不作用于当前对象。自检报告增加 `failure_stage` 和不含 SID/路径的 `details`，可区分 `ancestor_unsafe_allow` 与 Win32 `winerror`，避免把所有失败都归为权限不足。
+
+自检通过后，操作者可另行把私密项目目录选为 `%USERPROFILE%\qq-astra`，使用已有 `--prepare-windows-directory` 入口准备，再将配置和已有秘密文件放入其中。配置需显式设置 `"state_dir": "./state"`，让状态位于该私密目录下；仅移动 `config.json` 不会改变默认状态位置。此处不会自动搬迁现有状态或改动 AppData/Local 的 ACL。
+
+2026-10-20 的 Windows x64 / Python 3.13.3 原生检查：用户主目录下的新建临时目录通过私密/继承 ACL、宽/NULL DACL 拒绝、硬链接拒绝、目录写入/重命名保护和双进程锁。备份发布在 `MoveFileEx` 返回 `winerror=32`，重开和重解析点检查未完成。独立合成样本确认：保护句柄打开时重命名文件失败，关闭后成功。当前保留目录保护语义，未放开写入共享；须解决该冲突后才能完整验收。测试目录均已清理。自检已修正硬链接样本创建时机，并保证 SQLite 连接在异常路径关闭。
 
 ### OAuth 与状态约束
 

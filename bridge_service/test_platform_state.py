@@ -49,6 +49,24 @@ class PlatformStateTests(unittest.TestCase):
                 directory.create_file.assert_not_called()
                 self.assertFalse((Path(root) / "state" / "bridge.sqlite3").exists())
 
+    def test_windows_backup_preserves_sanitized_diagnostics_and_cleanup(self):
+        directory = state.StateDirectory("synthetic")
+        backend = MagicMock()
+        directory._windows = backend
+        temporary = Path("synthetic") / ".backup-fixture.sqlite3"
+        backend.new_file.return_value = temporary
+        failure = self.windows_error("do not expose arbitrary native text")
+        details = {"code": "native_file_error", "operation": "publish_backup", "winerror": 32}
+        failure.safe_details = lambda: details
+        backend.replace_file.side_effect = failure
+        with patch.object(directory, "_validate_database_files"), patch.object(directory, "_copy_backup"):
+            with self.assertRaises(state.StateError) as caught:
+                directory.backup()
+        self.assertEqual(caught.exception.windows_details, details)
+        self.assertNotIn("arbitrary native text", str(caught.exception))
+        self.assertEqual(backend.unlink_file.call_count, 4)
+        directory.close()
+
 
 if __name__ == "__main__":
     unittest.main()

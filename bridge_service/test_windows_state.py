@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from . import windows_state as ws
+from . import windows_selfcheck as selfcheck
 
 SID = "S-1-5-21-111-222-333-1001"
 PRIVATE = ws.DACL_PRESENT | ws.DACL_PROTECTED
@@ -40,6 +41,60 @@ def fake_api():
 
 
 class WindowsPolicyTests(unittest.TestCase):
+    def test_effective_full_control_is_rejected_even_when_inherited(self):
+        other = "S-1-5-21-444-555-666-1002"
+        for flags in (0, 3, 0x10, 0x13):
+            with self.subTest(flags=flags), self.assertRaises(ws.WindowsStateError) as caught:
+                ws.validate_ancestor_acl(SID, SID, ws.DACL_PRESENT, [(0, flags, ws.FILE_ALL_ACCESS, other)])
+            details = caught.exception.safe_details()
+            self.assertEqual(details["code"], "ancestor_unsafe_allow")
+            self.assertEqual(details["ace_flags"], flags)
+            self.assertTrue(details["rejected_mask"] & 0x40)  # DELETE_CHILD
+            self.assertTrue(details["rejected_mask"] & 0x40000)  # WRITE_DAC
+            self.assertNotIn(other, repr(details))
+            self.assertNotIn(SID, repr(details))
+        for flags in (0x0B, 0x1B):
+            ws.validate_ancestor_acl(SID, SID, ws.DACL_PRESENT, [(0, flags, ws.GENERIC_ALL, other)])
+
+    def test_directory_errors_distinguish_native_sharing_from_acl_policy(self):
+        api = fake_api()
+        api.file.CreateFile.side_effect = api.types.error(32)
+        with patch.object(ws, "_windows", return_value=api), self.assertRaises(ws.WindowsStateError) as caught:
+            ws._PinnedDirectories(r"C:\fixture")
+        self.assertEqual(caught.exception.safe_details(), {"code": "native_directory_error",
+            "operation": "open_directory", "ancestor_index": 0, "winerror": 32})
+        api.file.CreateFile.side_effect = lambda path, *args: Handle(path)
+        api.file.GetFileInformationByHandle = Mock(return_value=[0x10, None, None, None, 17, 0, 0, 1, 0, 1])
+        rejection = ws.WindowsStateError("synthetic", code="ancestor_unsafe_allow", ace_flags=16, rejected_mask=0x40)
+        with patch.object(ws, "_windows", return_value=api), patch.object(ws, "_ancestor_acl", side_effect=rejection), \
+             self.assertRaises(ws.WindowsStateError) as caught:
+            ws._PinnedDirectories(r"C:\fixture")
+        self.assertEqual(caught.exception.operation, "ancestor_acl")
+        self.assertEqual(caught.exception.ancestor_index, 0)
+        self.assertEqual(caught.exception.rejected_mask, 0x40)
+        self.assertNotIn("C:\\", repr(caught.exception.safe_details()))
+
+    def test_selfcheck_parent_is_existing_and_never_repaired(self):
+        with patch.object(selfcheck.Path, "is_dir", return_value=False):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                selfcheck._test_directory(r"C:\missing", "QQAstra-selfcheck-" + "a" * 32)
+            self.assertEqual(caught.exception.code, "selfcheck_parent_missing")
+        with patch.object(selfcheck.Path, "is_dir", return_value=True), patch.object(selfcheck.Path, "exists", return_value=True):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                selfcheck._test_directory(r"C:\existing", "QQAstra-selfcheck-" + "a" * 32)
+            self.assertEqual(caught.exception.code, "selfcheck_path_exists")
+        with self.assertRaises(ws.WindowsStateError):
+            selfcheck._test_directory("relative", "QQAstra-selfcheck-" + "a" * 32)
+
+    def test_selfcheck_cleanup_refuses_root_parent_and_unrelated_directory(self):
+        with patch.object(selfcheck.shutil, "rmtree") as remove:
+            for root, parent in (("C:\\", "C:\\"), (r"C:\existing", r"C:\existing"),
+                                 (r"C:\existing\unrelated", r"C:\existing"),
+                                 (r"C:\other\QQAstra-selfcheck-" + "a" * 32, r"C:\existing")):
+                with self.subTest(root=root), self.assertRaises(OSError):
+                    selfcheck._cleanup_test_directory(root, parent)
+            remove.assert_not_called()
+
     def test_getace_signed_windows_long_is_normalized_at_api_boundary(self):
         acl = SimpleNamespace(GetAceCount=lambda: 1,
                               GetAce=lambda index: ((0, 0), -2147483648, SID))
@@ -212,6 +267,23 @@ class WindowsPolicyTests(unittest.TestCase):
                 directory.replace_file(".backup-fixture.sqlite3", "bridge.sqlite3")
             with self.assertRaises(ws.WindowsStateError):
                 directory.unlink_file("bridge.lock")
+        directory.close()
+
+    def test_backup_sharing_error_reports_only_safe_native_details(self):
+        api = fake_api()
+        api.file.MOVEFILE_REPLACE_EXISTING, api.file.MOVEFILE_WRITE_THROUGH = 1, 8
+        api.file.FlushFileBuffers = Mock()
+        api.file.MoveFileEx = Mock(side_effect=api.types.error(32))
+        directory = ws.WindowsPrivateDirectory(r"C:\private")
+        directory._chain = SimpleNamespace(api=api, text=r"C:\private", close=Mock())
+        directory._temporary_names.add(".backup-fixture.sqlite3")
+        handle = Handle()
+        with patch.object(ws, "_file_handle", return_value=handle), patch.object(directory, "check_file", return_value=True):
+            with self.assertRaises(ws.WindowsStateError) as caught:
+                directory.replace_file(".backup-fixture.sqlite3", "bridge.backup.sqlite3")
+            self.assertTrue(handle.closed)
+            self.assertEqual(caught.exception.safe_details(), {"code": "native_file_error",
+                "operation": "publish_backup", "winerror": 32})
         directory.close()
 
 
