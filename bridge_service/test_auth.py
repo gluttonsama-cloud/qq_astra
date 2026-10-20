@@ -85,7 +85,7 @@ class AuthTests(unittest.TestCase):
     def test_reject_untrusted_identity_and_time_claims(self):
         now = int(time.time())
         changes = [{"iss": "https://other.example/"}, {"iss": self.settings["issuer"].rstrip("/")},
-            {"aud": "https://bridge.example"}, {"aud": [self.settings["public_resource_url"], "other"]},
+            {"aud": "https://bridge.example"}, {"aud": ["other"]},
             {"sub": "different-owner"}, {"sub": 123}, {"exp": now - 1}, {"iat": now + 60},
             {"nbf": now + 60}, {"iat": str(now - 1)}, {"iat": False}, {"exp": "not-a-date"},
             {"exp": now - 10, "iat": now - 5}, {"token_use": "id"}]

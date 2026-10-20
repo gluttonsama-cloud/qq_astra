@@ -3,6 +3,7 @@
   "oauth_issuer": "https://identity.example.invalid/",
   "owner_subject": "REPLACE_WITH_VERIFIED_OAUTH_SUBJECT",
   "jwks_file": "./public-jwks.json",
+  "secure_mcp_tunnel": false,
   "onebot_url": "http://127.0.0.1:3000",
   "onebot_token_file": "./onebot.token",
   "state_key_file": "./state.key",

@@ -80,8 +80,10 @@ class Application:
         self.bridge, self.auth, self.gateway_secret = bridge, authenticator, gateway_secret
         self.worker, self.state, self.closing = worker or QueueWorker(bridge), state, False
         resource = urlsplit(authenticator.public_resource_url)
-        self.mcp_path = resource.path or "/mcp"
-        self.metadata_path = urlsplit(authenticator.metadata_url).path
+        # Transport routes are local contracts, independent of Tunnel's
+        # connector-facing resource/audience (for example /v1/mcp/<id>).
+        self.mcp_path = "/mcp"
+        self.metadata_path = "/.well-known/oauth-protected-resource/mcp"
         self.local_host = f"127.0.0.1:{port}"
         self.hosts = {resource.netloc.lower(), self.local_host}
         self.origin = resource.scheme + "://" + resource.netloc
@@ -228,20 +230,35 @@ class Application:
             return await self._respond(send, 503, {"error": "service unavailable"})
 
 
+def _validate_auth_options(config):
+    remote = config.get("jwks_from_issuer", False)
+    tunnel = config.get("secure_mcp_tunnel", False)
+    if type(remote) is not bool or type(tunnel) is not bool:
+        raise ValueError("JWKS source and Tunnel mode must be booleans")
+    if (remote and "jwks_file" in config) or (not remote and "jwks_file" not in config):
+        raise ValueError("select exactly one JWKS source")
+    if not remote and config.get("jwks_proxy_url") is not None:
+        raise ValueError("JWKS proxy requires issuer retrieval")
+    validate_proxy_url(config.get("jwks_proxy_url"))
+
+
 def load_config(path):
     # Configuration contains paths and public identifiers, never inline secrets.
     raw = read_secret_file(path, max_bytes=65536)
     config = json.loads(raw)
-    required = {"public_resource_url", "oauth_issuer", "owner_subject", "jwks_file", "onebot_url",
+    required = {"public_resource_url", "oauth_issuer", "owner_subject", "onebot_url",
                 "onebot_token_file", "state_key_file", "account_id", "peer_id"}
-    optional = {"state_dir", "listen_port", "max_messages", "webhook_proxy_url"}
+    optional = {"state_dir", "listen_port", "max_messages", "webhook_proxy_url", "jwks_file",
+                "jwks_from_issuer", "jwks_proxy_url", "secure_mcp_tunnel"}
     if not isinstance(config, dict) or not required <= config.keys() or config.keys() - required - optional:
         raise ValueError("missing or unknown configuration fields")
     validate_callback_url(config["public_resource_url"])
     validate_proxy_url(config.get("webhook_proxy_url"))
+    _validate_auth_options(config)
     url = urlsplit(config["public_resource_url"])
-    if url.path != "/mcp" or url.query:
-        raise ValueError("public_resource_url must identify the HTTPS /mcp endpoint")
+    if (url.query or "?" in config["public_resource_url"]
+            or (not config.get("secure_mcp_tunnel", False) and url.path != "/mcp")):
+        raise ValueError("resource must be query-free; direct HTTPS mode requires /mcp")
     port = config.get("listen_port", 8765)
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("listen_port must be between 1024 and 65535")
@@ -257,8 +274,12 @@ def load_config(path):
 
 def validate_configuration(config):
     validate_proxy_url(config.get("webhook_proxy_url"))
+    _validate_auth_options(config)
     auth = Authenticator(issuer=config["oauth_issuer"], public_resource_url=config["public_resource_url"],
-                         owner_subject=config["owner_subject"], jwks_path=config["jwks_file"])
+                         owner_subject=config["owner_subject"], jwks_path=config.get("jwks_file"),
+                         jwks_from_issuer=config.get("jwks_from_issuer", False),
+                         jwks_proxy_url=config.get("jwks_proxy_url"),
+                         local_metadata_port=config.get("listen_port", 8765) if config.get("secure_mcp_tunnel", False) else None)
     token = read_secret_file(config["onebot_token_file"])
     if len(token) < 32:
         raise ValueError("OneBot token must contain at least 32 characters")
@@ -268,7 +289,7 @@ def validate_configuration(config):
 
 
 def create_application(config):
-    """Load existing configuration; no network calls or credential generation."""
+    """Load existing configuration; issuer JWKS retrieval starts on authentication."""
     auth, token, cipher, gateway = validate_configuration(config)
     state = StateDirectory(config.get("state_dir"))
     state.__enter__()
@@ -303,7 +324,7 @@ def main():
         config = load_config(args.config)
         if args.check:
             validate_configuration(config)
-            print("Authentication and secret-file configuration valid; no network or account connectivity was tested.")
+            print("Authentication settings and secret files valid; remote JWKS, network and account connectivity were not tested.")
             return
         if os.name == "posix":
             os.umask(0o077)
