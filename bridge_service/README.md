@@ -45,6 +45,18 @@ python -m bridge_service.runtime --config /private/path/config.json
 
 HTTPS 代理/Tunnel 只转发 `/mcp` 和 OAuth protected-resource metadata 路径；**不要转发 `/onebot/events`**。保留公共 Host，转发 Authorization；不信任 X-Forwarded-*。本机 `/healthz` 仅报告队列 worker 是否存活，不证明 QQ 登录或 dot 在线。公网访问、证书、Tunnel 和插件配置仍由操作者接入。
 
+### 可选：显式本机 HTTP CONNECT 出站代理
+
+`webhook_proxy_url` 默认 `null`（直连）。如操作者已有可信本机 HTTP CONNECT 代理，可显式配置为 `http://127.0.0.1:8080` 或 `http://[::1]:8080`，端口按实际填写。只影响 webhook 出站；不改变 QQ loopback 网关、入站 HTTPS/Tunnel 或系统设置。不读取 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY、Windows 代理设置或 PAC，也不自动回退到直连。
+
+首版只支持上述字面 loopback 地址、显式端口和无凭据 HTTP 代理。拒绝远程代理、localhost 域名、SOCKS、HTTPS 代理、用户名/密码、路径、查询和 fragment；代理要求认证时失败，不产生或保存凭据。`--check` 检查配置格式，不证明代理或网络可用。
+
+回调仍只允许公网 HTTPS:443。每次请求先在本机解析回调域名，检查**全部**结果均为允许的公网地址，再发送 `CONNECT <已验证数字IP>:443`（IPv6 使用方括号）。代理只收到数字目标；随后对原回调域名进行 TLS/SNI/证书校验，HTTP Host 仍为原域名，路径、签名及正文只在目标 TLS 内发送。不跟随回调或 CONNECT 跳转。DNS、代理连接、CONNECT 响应、目标 TLS 和 HTTP 共用总截止时间，CONNECT 响应头另有 16KiB 上限。
+
+本机 DNS 失败、返回私网/保留/合成地址（包括常见 fake-IP 段），或代理不支持数字 IP CONNECT 时都会拒绝，**不会改成代理解析域名或跳过 SSRF 检查**。经代理的普通 curl 成功不能替代这些检查。显式选择代理意味着信任其路由行为；应用固定 CONNECT 数字目标并验证目标 TLS，但无法证明代理内部未重映射目标。首版不承诺适配依赖代理远端 DNS 的环境。
+
+增量验证：`python -m unittest bridge_service.test_webhooks bridge_service.test_proxy_webhooks -v`。使用模拟 socket、合成回调地址与固定测试数据；不接触真实账号、网络代理或 Windows ACL。
+
 ### Windows PC 网关后备（待真机验证）
 
 QQ 网关与桥接均在 PC 上，dot 仍在云端。使用本地固定 NTFS 盘和普通用户 Python 3.11+；暂不支持 UNC/网络盘、SUBST、重解析目录、OneDrive占位文件和长路径。PC 必须在线；本项目不改防火墙、不安装系统服务、不公开 QQ 网关。Windows 使用 Ctrl+C 正常停止；关闭窗口、强制结束或断电可能硬中断，不能保证生成最后一份备份，重启按已提交状态恢复。
