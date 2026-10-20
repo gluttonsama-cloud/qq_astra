@@ -68,6 +68,7 @@ class CoreTests(unittest.TestCase):
         old_path = Path(self.temp.name) / "old.sqlite3"
         with sqlite3.connect(old_path) as db:
             db.execute("CREATE TABLE subscriptions(id TEXT PRIMARY KEY,url TEXT NOT NULL,secret TEXT NOT NULL,old_secret TEXT,rotate_until REAL,expires REAL NOT NULL,verified_until REAL NOT NULL,active INTEGER NOT NULL)")
+        db.close()  # sqlite3's context manager commits, but does not close on Windows.
         bridge = Bridge(old_path, principal="owner", account_id=100001, peer_id=100002, webhook_transport=self.callback)
         self.assertIn("id", bridge.subscribe("owner", self.params))
 
@@ -231,7 +232,8 @@ class CoreTests(unittest.TestCase):
             return self.bridge.rpc("owner", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
         self.assertEqual(rpc("server/discover")["result"]["supportedVersions"], ["2026-07-28"])
         self.assertEqual(len(rpc("events/list")["result"]["events"]), 1)
-        self.assertEqual({x["name"] for x in rpc("tools/list")["result"]["tools"]}, {"bridge_status", "qq_reply"})
+        from .media_tools import TOOL_SCOPES
+        self.assertEqual({x["name"] for x in rpc("tools/list")["result"]["tools"]}, {"bridge_status", "qq_reply", *TOOL_SCOPES})
         self.assertEqual(rpc("tools/call", {"name": "shell", "arguments": {}})["error"]["code"], -32602)
         self.assertIn("error", self.bridge.rpc("owner", []))
         self.assertIsNone(self.bridge.rpc("owner", {"jsonrpc": "2.0", "id": {}, "method": "tools/list"})["id"])

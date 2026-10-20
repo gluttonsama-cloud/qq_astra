@@ -1,4 +1,4 @@
-# QQ 文本桥接服务（Draft）
+# QQ 文字与媒体桥接服务（Draft）
 
 已有可配置运行入口，已验证本机合成闭环。**尚未完成真实 QQ、OAuth 授权、dot 或 Tunnel 联调。** 原始离线示例保留在 `offline_bridge/`。
 
@@ -100,7 +100,7 @@ py -3 -m venv .venv
 
 ## 明确限制与下一步
 
-仅支持好友私聊文本：入站最多64KB文字，回复最多16KB；媒体、文件、群聊、实时语音、主动无来源消息尚未实现。每个收到的事件最多一条回复；延迟回复可在该事件上完成，但不是无限次多消息会话发送接口。
+支持固定好友私聊文字和下述受限图片/表情；入站 JSON 最多64KB，文字回复最多16KB。通用文件、群聊、实时语音和任意来源消息尚未实现。文字回复仍限定每个事件一条；新增媒体写操作使用独立 request_id 和持久化队列。
 
 事件无历史回放（cursor 为 null）；订阅过期的未交付任务取消。活跃租约内重试最多5次；410/413等终止，不把2xx当作 dot 已处理。网关自身漏报不能补回。QQ 发送只有明确成功确认才标记 confirmed，结果不明需先核查 QQ 记录，不能盲目重发。
 
@@ -144,7 +144,7 @@ whole key set. Removed keys stop working at refresh, at latest cache expiry;
 there is no stale fallback or immediate remote revocation promise.
 
 Configure Auth0's RFC 9068 access-token profile, RS256, resource-parameter support,
-and the three `qq:*` API permissions. The provider still performs authorization
+and only the API permissions needed below. The provider still performs authorization
 code + PKCE, user consent and token issuance; this bridge does not create them.
 Real account availability, OAuth linking, Tunnel discovery and event delivery
 remain untested. No credentials or real tokens are included in these examples.
@@ -155,3 +155,36 @@ Portable regressions (mocked network, no live account):
 Sources: [OpenAI Tunnel v0.0.16 configuration](https://github.com/openai/tunnel-client/blob/v0.0.16/docs/configuration.md),
 [Auth0 access-token profiles](https://auth0.com/docs/secure/tokens/access-tokens/access-token-profiles),
 [Auth0 JWKS](https://auth0.com/docs/secure/tokens/json-web-tokens/json-web-key-sets).
+
+### 图片、表情与显式空间发布（SnowLuma v2.0.3）
+
+| 工具 | 行为 | 独立 OAuth scope |
+| --- | --- | --- |
+| `qq_read_image` | 读取已准入事件的附件，返回真正的 MCP image 内容 | `qq:media:read` |
+| `qq_list_faces` / `qq_list_custom_faces` | 查询网关的系统表情/机器人自己的收藏表情目录 | `qq:media:read` |
+| `qq_send_image` | 将用户提供的 PNG/JPEG/WebP/GIF 发给固定好友，可选择表情展示 | `qq:media:send` |
+| `qq_send_face` / `qq_send_custom_face` | 验证实际目录后发送；收藏使用专门的 `send_custom_face` | `qq:media:send` |
+| `qq_send_market_face` | 复用已准入消息的商城表情；缺少 package/key 时拒绝发送 | `qq:media:send` |
+| `qq_publish_qzone` | 发布明确请求的文字或最多三张图片到**机器人自己的空间** | `qq:qzone:publish` |
+| `qq_operation_status` | 查询持久化操作结果；不触发重发 | `qq:read` |
+
+原有 `qq:read`、`qq:events`、`qq:reply` 不隐式授予新权限；模板和代码不会创建或扩大真实 grant。空间正文、`images`（无图为 `[]`）、`ugc_right`、`target_uins` 都必须明确传入：1 所有人、4 好友、16 指定好友、64 自己、128 排除指定好友。16/128 需要非空目标名单，其他可见范围要求 `[]`；没有公开默认值。工具声明为外部写操作，只应响应 ChatGPT 用户直接提出的发布请求，不能由收到的 QQ 内容或事件自动发布。入站处理程序不会调用发布。服务端不能仅凭同一个 bearer token 区分真人指令和自动化；部署时须单独限制发布 scope 并保留客户端写操作审批，不应将它授予收信自动化。
+
+身份由配置的 `peer_id` 与签名入站 sender 一致性确定，`account_id/self_id` 是机器人账号。事件中独立的 `sender_identity` 提供 `bound_owner`、真实固定 QQ ID、bot QQ ID 和稳定 `conversation_key`，不从昵称、第一位发信人或正文“我是主人”推断。它帮助 dot 关联同一人的聊天上下文，但不保证 dot 自动共享记忆、接续原对话或持续保留人格；这些须真实连接后验收。
+
+图片输入遵守 OpenAI `_meta["openai/fileParams"]`：对象声明 `download_url`、`file_id`、`mime_type`、`file_name`，只要求前两项。`file_download_hosts` 默认为 `[]`，因此用户文件下载默认关闭。实际连接后，由操作者核实文件提供方的精确域名再配置（最多八个）；不要推测域名、使用通配符或相信模型提供的任意 URL。文件名从不作为本地路径使用。入站只接受已签名且属于固定好友事件的 QQ CDN 源，公开事件仅含 opaque 附件引用；`get_image` 刷新只允许同一资源的 rkey 更新。
+
+所有下载限定 HTTPS:443、完整 DNS 公网检查、固定 IP 和原域名 TLS 校验；禁跳转、压缩和隐式代理。`media_proxy_url` 默认 `null`，可单独选择与 webhook 相同规则的无凭据 loopback HTTP CONNECT 代理，不修改系统设置。网络总截止时间10秒，最多两个并发读取/解码。实际字节与 MIME 必须一致：每张最多4MiB、每帧400万像素、最多64帧且合计3200万像素；只允许 GIF 动画。读图生成无元数据、最长边1024像素以内的 PNG；GIF 只展示首帧，不能据此声称看过完整动作。发送 GIF 保留已验证的原始动画字节。真实 dot 是否展示/理解图片、实际文件下载域名和 QQ 展示效果仍未验收。
+
+不缓存图片文件。私有源信息加密保存24小时，过期逻辑清理；发送字节仅在加密 outbox 中暂存，15分钟未发送即过期。最多16个待处理操作、32MiB序列化载荷、1000个持久去重记录，容量满时拒绝新操作。终态清空载荷，备份/WAL可能仍保留旧加密页，这不是安全擦除。相同 `request_id`/内容重试返回既有状态；不同内容冲突。网关响应丢失或发送中进程中断标记 `uncertain`，不自动重发，也不要换 request_id 重试；空间图片可能已上传而发布结果未知。
+
+合成验证，不读取真实收藏/聊天，不发布真实消息：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest bridge_service.test_media bridge_service.test_service bridge_service.test_oauth_tunnel bridge_service.test_webhooks bridge_service.test_proxy_webhooks bridge_service.test_windows_state bridge_service.test_platform_state -q
+.\.venv\Scripts\python.exe -m bridge_service.windows_media_assembly --parent-directory "$env:USERPROFILE"
+```
+
+Windows 装配创建可清理的受保护临时目录、真实桥接子进程及 loopback 模拟 QQ/回调/图片 HTTP 服务；仅测试入口将固定合成源映射到模拟服务器。它验证 OAuth scope、签名事件、图像解码、各类发送、幂等、不确定状态、备份与重启；不验证公网 DNS/TLS、真实 QQ 或 dot。旧 `test_auth` 中的 POSIX chmod/软链接权限用例不适用于 Windows；这里由 portable OAuth 用例、Windows ACL 测试和受保护 JWKS 的实际装配覆盖相关路径，未修改生产权限校验。
+
+协议与固定版本来源：[OpenAI fileParams](https://developers.openai.com/plugins/reference#define-file-inputs)、[MCP 图像内容](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#image-content)、[SnowLuma 发送与收藏表情](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/message.ts)、[扩展读接口](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/extended.ts)、[图片与商城表情编码](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/element-codecs.ts)、[空间发布](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/qzone.ts)。

@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from .state import StateError, read_public_key_file
 from .webhooks import _PublicHTTPSConnection, _remaining, validate_callback_url, validate_proxy_url
 
-SCOPES = ("qq:read", "qq:events", "qq:reply")
+SCOPES = ("qq:read", "qq:events", "qq:reply", "qq:media:read", "qq:media:send", "qq:qzone:publish")
 _ALGORITHMS = {"RS256": "RSA", "ES256": "EC"}
 _PRIVATE_FIELDS = {"d", "p", "q", "dp", "dq", "qi", "oth", "k"}
 _TOKEN = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
