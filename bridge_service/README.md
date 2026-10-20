@@ -92,8 +92,8 @@ py -3 -m venv .venv
 
 ### OAuth 与状态约束
 
-- 仅接收 `typ=at+jwt` 或 `application/at+jwt` 的 RS256/ES256 access token，严格校验签名、issuer、单一精确 audience、固定 subject、时间和 scope。持久身份同时绑定 issuer、resource 与 subject，改变其中任一项不能复用旧状态。通用 `typ=JWT`、ID token、opaque token 不支持；身份提供方必须匹配此配置。
-- `qq:read` 用于发现/目录/状态，`qq:events` 用于订阅，`qq:reply` 用于回复；完整桥接需授予三项权限。工具缺权限或凭据过期时返回标准重新授权 metadata；发现/Events 使用 HTTP challenge，实际授权界面仍待联调。公钥文件每次校验重读，原子替换支持公钥轮换。服务不下载不受信任的 token 内 JWKS URL。
+- Accept only explicitly typed `at+jwt` / `application/at+jwt` RS256/ES256 access tokens. Verify signature, exact issuer, fixed owner subject, time and route scope. `aud` must be the exact resource string or a nonempty array of nonempty strings containing that exact resource. ID tokens, generic `typ=JWT`, opaque tokens and local transport URLs as audience are rejected. Persisted identity remains bound to issuer + external resource + subject.
+- `qq:read` protects discovery/status, `qq:events` subscriptions, and `qq:reply` replies. Permission failures keep the existing HTTP/MCP relinking challenges. Local public JWKS files are reread for every validation; opt-in issuer retrieval follows the bounded cache policy below. Token-provided key URLs are always rejected.
 - 生产订阅最多持续1小时，并且不能超过创建/刷新 access token 的有效期。没有 OAuth introspection；已创建的订阅在租约内仍有效，停服务或本地撤销绑定可立即阻止后续工作。已开始的网络发送无法撤回。
 - 默认状态路径：Linux 为 `$XDG_STATE_HOME/qq-astra` 或 `~/.local/state/qq-astra`，需本机可靠 SQLite/flock 文件系统；Windows 为 `%LOCALAPPDATA%\qq-astra`，需上述本地 NTFS/ACL 与 LockFileEx 支持。自动保留最多10,000条收件，可用 `max_messages` 调至1–100,000；达到上限会拒绝新消息，不暗中删数据。暂不提供保留期清理或密钥迁移。
 - 正常重启自动恢复已提交队列；中断的 QQ 发送标记 `uncertain`，不重发。停止备份为 `bridge.backup.sqlite3`；损坏时保留原库和 sidecar，拒绝启动，不自动用旧备份覆盖。人工恢复需停服务、保留原文件、验证备份及同一 state key/绑定。加密不隐藏数量、时序等元数据，也不防御已控制服务账号的攻击者。
@@ -112,3 +112,46 @@ py -3 -m venv .venv
 - [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/python)、[PyJWT](https://pyjwt.readthedocs.io/en/stable/api.html)、[JWT access token 类型](https://www.rfc-editor.org/rfc/rfc9068.html)。
 - SnowLuma v2.0.3：[HTTP 签名](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/network/http-post-adapter.ts)、[私聊事件](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/event-converter/to-message.ts)、[发送](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/message.ts)、[账号查询](https://github.com/SnowLuma/SnowLuma/blob/v2.0.3/packages/onebot/src/actions/info.ts)。只做静态源码对齐，未运行网关。
 - Windows：[CreateFileW 句柄与共享模式](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)、[文件访问权限](https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants)、[pywin32 API](https://mhammond.github.io/pywin32/)；候选实现仍需 Windows 本机自检与联调。
+
+### Secure MCP Tunnel and opt-in issuer JWKS
+
+The listener always serves `/mcp` and `/.well-known/oauth-protected-resource/mcp`
+on loopback. With `"secure_mcp_tunnel": true`, `public_resource_url` is the exact
+connector-facing HTTPS resource after OpenAI's rewrite, independent of those local
+routes. Copy the actual resource from the connection; do not invent a tunnel URL.
+The local 401 challenge points to the fixed loopback metadata endpoint for Tunnel
+client discovery. Direct HTTPS mode keeps the existing `/mcp` requirement.
+Changing only the transport mode/port does not change the persisted identity.
+
+For Auth0-style HTTPS root issuers, replace `jwks_file` with
+`"jwks_from_issuer": true`. These sources are mutually exclusive. The only remote
+key URL is `<configured issuer>/.well-known/jwks.json`; issuer paths, URL discovery,
+redirects and token-supplied URLs cannot change it. `--check` remains offline and
+does not prove remote keys are available. Retrieval starts on authentication.
+
+Remote JWKS accepts at most 1 MiB / 64 validated public signing keys. A fetch has
+a 5-second total network deadline; DNS answers must all be public, the connection
+pins a validated IP, and TLS verifies the original issuer hostname. Redirects,
+compressed responses and ambient proxies are rejected. Optional `jwks_proxy_url`
+uses the same explicit credential-free loopback CONNECT policy as webhooks; it
+is separate from `webhook_proxy_url` and never changes global proxy settings.
+
+The memory cache expires after 5 minutes. An unknown `kid` may trigger an early
+refresh, with one shared 60-second cooldown and one concurrent fetch; unknown IDs
+are not retained. Failed refreshes clear every cached key and fail authentication
+closed (503), including during the cooldown. A successful refresh replaces the
+whole key set. Removed keys stop working at refresh, at latest cache expiry;
+there is no stale fallback or immediate remote revocation promise.
+
+Configure Auth0's RFC 9068 access-token profile, RS256, resource-parameter support,
+and the three `qq:*` API permissions. The provider still performs authorization
+code + PKCE, user consent and token issuance; this bridge does not create them.
+Real account availability, OAuth linking, Tunnel discovery and event delivery
+remain untested. No credentials or real tokens are included in these examples.
+
+Portable regressions (mocked network, no live account):
+`python -m unittest bridge_service.test_oauth_tunnel bridge_service.test_webhooks bridge_service.test_proxy_webhooks -v`
+
+Sources: [OpenAI Tunnel v0.0.16 configuration](https://github.com/openai/tunnel-client/blob/v0.0.16/docs/configuration.md),
+[Auth0 access-token profiles](https://auth0.com/docs/secure/tokens/access-tokens/access-token-profiles),
+[Auth0 JWKS](https://auth0.com/docs/secure/tokens/json-web-tokens/json-web-key-sets).
